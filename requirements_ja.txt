@@ -1,4 +1,4 @@
-# ask-ai_ja.py の依存パッケージ
+# AIHelper_ja.py の依存パッケージ
 #
 # インストール:
 #   pip install -r requirements.txt
