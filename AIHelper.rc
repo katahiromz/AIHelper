@@ -1,0 +1,85 @@
+// ai-assist.rc
+// このファイルは リソーエディタ 6.1.4 によって自動生成されました。
+// † <-- このダガー記号は、UTF-8の検出に役立ちます。
+//////////////////////////////////////////////////////////////////////////////
+// TEXTINCLUDE 1 から生成されました
+
+#include "resource.h"
+
+//////////////////////////////////////////////////////////////////////////////
+// TEXTINCLUDE 2 から生成されました
+
+#define APSTUDIO_HIDDEN_SYMBOLS
+#include <windows.h>
+#include <commctrl.h>
+#include <richedit.h>
+#undef APSTUDIO_HIDDEN_SYMBOLS
+
+//////////////////////////////////////////////////////////////////////////////
+
+#pragma code_page(65001) // UTF-8
+
+//////////////////////////////////////////////////////////////////////////////
+
+LANGUAGE LANG_JAPANESE, SUBLANG_DEFAULT
+
+//////////////////////////////////////////////////////////////////////////////
+// RT_DIALOG
+
+IDD_AIHELPERCONSOLE DIALOG 0, 0, 283, 133
+CAPTION "AI Helper Console"
+STYLE DS_CENTER | WS_POPUPWINDOW | WS_CAPTION | WS_THICKFRAME | WS_MAXIMIZEBOX
+EXSTYLE WS_EX_TOOLWINDOW
+FONT 9, "MS UI Gothic"
+{
+    LISTBOX lst1, 5, 7, 270, 98, LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS | LBS_EXTENDEDSEL | WS_VSCROLL | WS_TABSTOP | WS_HSCROLL
+    EDITTEXT edt1, 6, 113, 203, 14, ES_AUTOHSCROLL
+    DEFPUSHBUTTON "Enter", IDOK, 215, 112, 60, 14
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// RT_STRING
+
+STRINGTABLE
+{
+    IDS_APPNAME "AI Assistant"
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// TEXTINCLUDE
+
+LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
+
+#ifdef APSTUDIO_INVOKED
+
+1 TEXTINCLUDE
+{
+    "resource.h\0"
+}
+
+2 TEXTINCLUDE
+{
+    "#define APSTUDIO_HIDDEN_SYMBOLS\r\n"
+    "#include <windows.h>\r\n"
+    "#include <commctrl.h>\r\n"
+    "#include <richedit.h>\r\n"
+    "#undef APSTUDIO_HIDDEN_SYMBOLS\r\n"
+    "\0"
+}
+
+3 TEXTINCLUDE
+{
+    "\r\n"
+    "\0"
+}
+
+#endif // def APSTUDIO_INVOKED
+
+//////////////////////////////////////////////////////////////////////////////
+// TEXTINCLUDE 3 から生成されました
+
+#ifndef APSTUDIO_INVOKED
+
+#endif // ndef APSTUDIO_INVOKED
+
+//////////////////////////////////////////////////////////////////////////////
