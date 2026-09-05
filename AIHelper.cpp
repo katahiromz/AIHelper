@@ -274,10 +274,12 @@ static BOOL StartAIProcess(HWND hwnd)
 	// 実行するコマンドをlst1に出力する
 	AddLineToList(hwnd, (L"> " + str).c_str());
 
-	// Pythonの標準入出力をUTF-8に固定し、文字化けを防ぐ
+	// 環境変数をセットする。
 	SetEnvironmentVariableW(L"PYTHONIOENCODING", L"utf-8");
 
-	g_maker.SetShowWindow(SW_HIDE);
+	// 子プロセスのウィンドウを作成しない。
+	g_maker.SetCreationFlags(CREATE_NO_WINDOW);
+
 	if (!g_maker.PrepareForRedirect(&g_hInputWrite, &g_hOutputRead) ||
 		!g_maker.CreateProcessDx(nullptr, str.c_str()))
 	{
@@ -322,7 +324,14 @@ void AskAIQuestion(HWND hwnd, PWSTR text)
 	// 入力した質問をlst1にエコー表示する
 	AddLineToList(hwnd, (L"> " + std::wstring(text)).c_str());
 
-	std::wstring line = text;
+	std::wstring line;
+#ifdef XWORDGIVER
+	std::wstring XG_GetAIPreText();
+	std::wstring pre_text = XG_GetAIPreText();
+	line += pre_text;
+	line += L"---";
+#endif
+	line += text;
 	line += L"\n";
 
 	std::string utf8 = WideToUtf8(line.c_str());
@@ -407,6 +416,7 @@ static void OnDestroy(HWND hwnd)
 {
 	StopAIProcess();
 	g_hwndAIHelper = nullptr;
+	PostQuitMessage(0);
 }
 
 static INT_PTR CALLBACK
