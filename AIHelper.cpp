@@ -57,6 +57,34 @@ static int MeasureLineWidth(HWND hLst1, LPCWSTR pszLine)
 	return cxWidth;
 }
 
+// 文字列中に含まれる "(*...*)" 形式のタグ（XG_GetAIPreTextによる前置情報など）を
+// すべて取り除いた文字列を返す。表示前のフィルタリング用。
+static std::wstring StripAiPreTextTag(LPCWSTR pszLine)
+{
+	std::wstring result;
+	const wchar_t *pch = pszLine;
+
+	while (*pch)
+	{
+		if (pch[0] == L'(' && pch[1] == L'*')
+		{
+			const wchar_t *pEnd = wcsstr(pch + 2, L"*)");
+			if (pEnd)
+			{
+				pch = pEnd + 2;
+				// タグ直後の空白も1つ読み飛ばす（"(*...*) " のように付与されるため）
+				if (*pch == L' ')
+					++pch;
+				continue;
+			}
+		}
+		result += *pch;
+		++pch;
+	}
+
+	return result;
+}
+
 // lst1に1行追加し、末尾までスクロールする。
 // 横スクロールできるよう、必要に応じて水平スクロール範囲も広げる。
 static void AddLineToList(HWND hwnd, LPCWSTR pszLine)
@@ -65,10 +93,17 @@ static void AddLineToList(HWND hwnd, LPCWSTR pszLine)
 	if (!hLst1)
 		return;
 
-	INT iIndex = (INT)SendMessageW(hLst1, LB_ADDSTRING, 0, (LPARAM)pszLine);
+	// (*...*) タグを除去してから表示する
+	std::wstring filtered = StripAiPreTextTag(pszLine);
+	if (filtered.empty())
+		return; // タグのみの行（プロンプト等）は表示しない
+
+	LPCWSTR pszDisplay = filtered.c_str();
+
+	INT iIndex = (INT)SendMessageW(hLst1, LB_ADDSTRING, 0, (LPARAM)pszDisplay);
 	SendMessageW(hLst1, LB_SETTOPINDEX, (WPARAM)iIndex, 0);
 
-	int cxLine = MeasureLineWidth(hLst1, pszLine);
+	int cxLine = MeasureLineWidth(hLst1, pszDisplay);
 	int cxExtent = (int)SendMessageW(hLst1, LB_GETHORIZONTALEXTENT, 0, 0);
 	if (cxLine + 10 > cxExtent)
 		SendMessageW(hLst1, LB_SETHORIZONTALEXTENT, (WPARAM)(cxLine + 10), 0);
@@ -328,8 +363,9 @@ void AskAIQuestion(HWND hwnd, PWSTR text)
 #ifdef XWORDGIVER
 	std::wstring XG_GetAIPreText();
 	std::wstring pre_text = XG_GetAIPreText();
+	line += L"(*";
 	line += pre_text;
-	line += L"---";
+	line += L"*) ";
 #endif
 	line += text;
 	line += L"\n";
