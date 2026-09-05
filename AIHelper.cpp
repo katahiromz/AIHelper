@@ -416,7 +416,9 @@ static void OnDestroy(HWND hwnd)
 {
 	StopAIProcess();
 	g_hwndAIHelper = nullptr;
+#ifdef AIHELPER_STANDALONE
 	PostQuitMessage(0);
+#endif
 }
 
 static INT_PTR CALLBACK
