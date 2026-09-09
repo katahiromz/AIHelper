@@ -1,65 +1,419 @@
-﻿// AIHelper.cpp --- AI Helper
+﻿// AIHelper.cpp --- XWordGiver AI Helper
 // Author: katahiromz
 // License: MIT
+#include "DetectLeaks.h"
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <tchar.h>
 #include <shlwapi.h>
+#include <imm.h>
 #include <string>
 #include <vector>
-#include "MFile.hpp"
-#include "MProcessMaker.hpp"
+#include <memory>
+#include <cassert>
+#include <strsafe.h>
+#ifdef USE_PYTHON
+	#include "MFile.hpp"
+	#include "MProcessMaker.hpp"
+#else
+	#include "AIHelper2.h"
+#endif
+#include "MString.hpp"
 #include "MResizable.hpp"
 #include "AIHelper.h"
 #include "resource.h"
 
-HINSTANCE g_hAIHelperInst = nullptr;
+// インスタンス ハンドル。
+HINSTANCE xg_hAIHelperInst = nullptr;
 
 // ダイアログのリサイズ処理を担当する
-static MResizable g_resizable;
+static MResizable xg_resizable;
 
 // 起動しっぱなしにするAIHelper_ja.pyプロセスとそのパイプ
-static MProcessMaker g_maker;
-static MFile         g_hInputWrite;
-static MFile         g_hOutputRead;
-static HANDLE        g_hReaderThread = nullptr;
-static volatile BOOL g_bReaderStop = FALSE;
+#ifdef USE_PYTHON
+static MProcessMaker xg_process_maker;
+static MFile         xg_hInputWrite;
+static MFile         xg_hOutputRead;
+static HANDLE        xg_hReaderThread = nullptr;
+static volatile BOOL xg_bReaderStop = FALSE;
+#endif
 
-HWND g_hwndAIHelper = nullptr;
+// AIHelper(_ja).pyが起動完了して標準入力の受付準備ができたときにセットされる
+static HANDLE        xg_hReadyEvent = nullptr;
 
-void AskAIQuestion(HWND hwnd, PWSTR text);
-BOOL OpenAIHelper(HWND hwndOwner, BOOL bOpen);
+HWND xg_hwndAIHelper = nullptr;
+std::wstring xg_ai_provider = L"gemini";
+std::wstring xg_ai_model = L"gemini-3.6-flash";
+std::wstring xg_additional_instruction;
+std::wstring xg_output_buffer;
+std::wstring xg_initial_question;
 
-// 子プロセスの出力の1行をUIスレッドへ渡すためのカスタムメッセージ
-// (WPARAMは未使用、LPARAMはnewしたPWSTR。受け取った側でdelete[]すること)
-#define WM_APP_AI_LINE   (WM_APP + 1)
+// AIヘルパーの位置とサイズ。
+INT xg_nHelperX = CW_USEDEFAULT;
+INT xg_nHelperY = CW_USEDEFAULT;
+INT xg_nHelperCX = CW_USEDEFAULT;
+INT xg_nHelperCY = CW_USEDEFAULT;
 
-// pszLineの表示幅（ピクセル）を、lst1で使われているフォントで計測する
-static int MeasureLineWidth(HWND hLst1, LPCWSTR pszLine)
+BOOL XgIsUserJapanese(VOID) noexcept;
+BOOL Helper_Open(HWND hwndOwner);
+void Helper_WaitForReady(void);
+void Helper_AskQuestion(HWND hwnd, PCWSTR text);
+static void Helper_AddLine(HWND hwnd, PCWSTR pszLine);
+
+//////////////////////////////////////////////////////////////////////////////
+// DIALOGリソースを使わずに、ダイアログと同じ操作性（Tab移動、Enterで既定ボタン、
+// Escで閉じる、等）を持つウィンドウを実現するための仕組み。
+//
+// 手口：ウィンドウクラスの既定プロシージャにDefDlgProcWを指定し、DLGWINDOWEXTRA分の
+// 拡張バイトを確保しておく。ウィンドウ作成後、DWLP_DLGPROCへ自前のDialogProcを
+// セットしてからWM_INITDIALOGを自分で送ってやると、以後はCreateDialog系APIで
+// 作った場合と全く同じ挙動になる（IsDialogMessageWによるキーボード操作もそのまま効く）。
+
+static PCWSTR const AIHELPERCONSOLE_CLASSNAME = L"AIHelperConsoleClass";
+
+// 現在のズーム後のフォントサイズ（Ctrl+ホイールで変更する）
+INT xg_nHelperFontPointSize = 11;
+static const INT g_nFontPointSizeMin = 6;
+static const INT g_nFontPointSizeMax = 36;
+
+// lst1/edt1/IDOKで共有する、現在使用中のフォント
+static HFONT g_hFont = nullptr;
+
+static void Helper_OnZoom(HWND hwndDlg, int nDelta);
+
+// 現在の言語・ズーム設定に応じたフォントを作る（呼び出し側でDeleteObjectすること）
+static HFONT CreateAIHelperFont(HWND hwnd, int nPointSize)
 {
-	int cxWidth = 0;
+	LOGFONTW lf = { 0 };
 
-	HDC hdc = GetDC(hLst1);
-	if (!hdc)
-		return 0;
+	HDC hdc = GetDC(hwnd);
+	lf.lfHeight = -MulDiv(nPointSize, GetDeviceCaps(hdc, LOGPIXELSY), 72);
+	ReleaseDC(hwnd, hdc);
 
-	HFONT hFont = (HFONT)SendMessageW(hLst1, WM_GETFONT, 0, 0);
-	HFONT hFontOld = hFont ? (HFONT)SelectObject(hdc, hFont) : nullptr;
+	lf.lfWeight = FW_NORMAL;
+	lf.lfCharSet = DEFAULT_CHARSET;
+	lf.lfQuality = DEFAULT_QUALITY;
+	lf.lfOutPrecision = OUT_DEFAULT_PRECIS;
+	lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+	lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+	StringCchCopyW(lf.lfFaceName, _countof(lf.lfFaceName),
+		XgIsUserJapanese() ? L"MS UI Gothic" : L"Tahoma");
+
+	return CreateFontIndirectW(&lf);
+}
+
+// 最初の質問を作成する。
+std::wstring XgMakeInitialQuestion_ja(void)
+{
+	// TODO: 編集せよ
+	std::wstring str = L"(* "
+		L"まずは60字程度のあいさつをして、あなたができることを簡単に説明してください。"
+	L"*) ";
+	return str;
+}
+
+// Create the first question.
+std::wstring XgMakeInitialQuestion_en(void)
+{
+	// TODO: Do edit
+	std::wstring str = L"(* "
+		L"First, please provide a greeting of around 60 characters and briefly explain what you can do. "
+	L"*) ";
+	return str;
+}
+
+// Create the first question.
+std::wstring XgMakeInitialQuestion(void)
+{
+	return XgIsUserJapanese() ? XgMakeInitialQuestion_ja() : XgMakeInitialQuestion_en();
+}
+
+std::wstring XgGetAIStatus(void);
+
+// AI入力前のテキスト（日本語）。
+std::wstring XG_GetAIPreText_ja(void)
+{
+	std::wstring str = L"(* ";
+	str += XgGetAIStatus();
+	str += L" *) ";
+	return str;
+}
+
+// Pre-input text for the AI (English).
+std::wstring XG_GetAIPreText_en(void)
+{
+	std::wstring str = L"(* ";
+	str += XgGetAIStatus();
+	str += L" *) ";
+	return str;
+}
+
+// AI入力前のテキスト。
+std::wstring XG_GetAIPreText(void)
+{
+	return XgIsUserJapanese() ? XG_GetAIPreText_ja() : XG_GetAIPreText_en();
+}
+
+// 文字列lineのpos以降から、「[[key:text]]」形式のシステムコマンドを1つ探す。
+// key/textが空の[[ ]]（コマンドの体をなしていないもの）は読み飛ばして次を探す。
+// 見つかった場合はkey/textに分解してtrueを返し、posを閉じ括弧「]]」の次の位置まで
+// 進める（＝呼び出し側はそのままposを使って次のFindNextAICommand呼び出しへ進める）。
+// 見つからなければfalseを返す。
+static bool FindNextAICommand(const std::wstring& line, size_t& pos, std::wstring& outKey, std::wstring& outText)
+{
+	for (;;) {
+		// [[と]]を探す
+		size_t openPos = line.find(L"[[", pos);
+		if (openPos == line.npos)
+			return false;
+		size_t closePos = line.find(L"]]", openPos + 2);
+		if (closePos == line.npos)
+			return false;
+
+		// [[ ]]の内側
+		auto inner = line.substr(openPos + 2, closePos - openPos - 2);
+		pos = closePos + 2;
+
+		// "...:..." の形式を期待する。
+		size_t colonPos = inner.find(L':');
+		if (colonPos == inner.npos)
+			colonPos = inner.find((wchar_t)0xFF1A); // 全角の '：'
+		if (colonPos == inner.npos)
+			continue; // コマンドの形式でない[[ ]]は読み飛ばす
+
+		auto key = inner.substr(0, colonPos);
+		auto text = inner.substr(colonPos + 1);
+		if (key.empty() || text.empty())
+			continue;
+
+		outKey = std::move(key);
+		outText = std::move(text);
+		return true;
+	}
+}
+
+// AIヘルパーからの出力行を解析し、「[[...:...]]」形式の
+// コマンドを見つけたら、該当するカギ文章を書き換える。
+// 1行に複数のコマンドが含まれていてもすべて処理する。
+void CALLBACK XgParseAndApplyAICommand(PCWSTR pszLine)
+{
+	std::wstring line = pszLine;
+	size_t pos = 0;
+
+	// 半角カッコと全角カッコ、まぎわらしいので半角に統一。
+	mstr_replace_all(line, L"［［", L"[[");
+	mstr_replace_all(line, L"〔〔", L"[[");
+	mstr_replace_all(line, L"］］", L"]]");
+	mstr_replace_all(line, L"〕〕", L"[[");
+
+	std::wstring key, text;
+	while (FindNextAICommand(line, pos, key, text)) {
+		// TODO: ここでシステムコマンドを処理する。
+	}
+}
+
+// AIに現在の状態を報告する（日本語）。
+std::wstring XgGetAIStatus_ja(void)
+{
+	std::wstring ret;
+
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+
+	ret += L"ただいま";
+	ret += std::to_wstring(st.wYear);
+	ret += L"年";
+	ret += std::to_wstring(st.wMonth);
+	ret += L"月";
+	ret += std::to_wstring(st.wDay);
+	ret += L"日";
+	ret += std::to_wstring(st.wHour);
+	ret += L"時";
+	ret += std::to_wstring(st.wMinute);
+	ret += L"分";
+	ret += std::to_wstring(st.wSecond);
+	ret += L"秒です。";
+
+	return ret;
+}
+
+// Report the current state to the AI (English).
+std::wstring XgGetAIStatus_en(void)
+{
+	std::wstring ret;
+
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+
+	ret += L"Now, it's ";
+	ret += std::to_wstring(st.wYear);
+	ret += L"-";
+	ret += std::to_wstring(st.wMonth);
+	ret += L"-";
+	ret += std::to_wstring(st.wDay);
+	ret += L" ";
+	ret += std::to_wstring(st.wHour);
+	ret += L":";
+	ret += std::to_wstring(st.wMinute);
+	ret += L":";
+	ret += std::to_wstring(st.wSecond);
+	ret += L".";
+
+	return ret;
+}
+
+// AIに現在の状態を報告する。
+std::wstring XgGetAIStatus(void)
+{
+	return XgIsUserJapanese() ? XgGetAIStatus_ja() : XgGetAIStatus_en();
+}
+
+// 指定フォントから「ダイアログ基準単位」を求める、ダイアログマネージャが内部で
+// 使っているのと同じ古典的な計算式（DIALOGEXの座標系(DU)をpxへ変換するために使う）
+static void
+Helper_ComputeDialogBaseUnits(HFONT hFont, LONG &baseUnitX, LONG &baseUnitY)
+{
+	HDC hdc = GetDC(nullptr);
+	HFONT hFontOld = (HFONT)SelectObject(hdc, hFont);
+
+	TEXTMETRICW tm;
+	GetTextMetricsW(hdc, &tm);
 
 	SIZE size;
-	if (GetTextExtentPoint32W(hdc, pszLine, (int)wcslen(pszLine), &size))
-		cxWidth = size.cx;
+	static const WCHAR s_szAlphabet[] =
+		L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	GetTextExtentPointW(hdc, s_szAlphabet, 52, &size);
 
-	if (hFontOld)
-		SelectObject(hdc, hFontOld);
-	ReleaseDC(hLst1, hdc);
+	baseUnitX = (size.cx / 26 + 1) / 2;
+	baseUnitY = tm.tmHeight;
 
-	return cxWidth;
+	SelectObject(hdc, hFontOld);
+	ReleaseDC(nullptr, hdc);
 }
+
+static inline int DuToPixelX(LONG du, LONG baseUnitX) { return MulDiv((int)du, (int)baseUnitX, 4); }
+static inline int DuToPixelY(LONG du, LONG baseUnitY) { return MulDiv((int)du, (int)baseUnitY, 8); }
+
+// AIHelperConsoleクラスを登録する（DefDlgProcWをウィンドウプロシージャに指定し、
+// DLGWINDOWEXTRA分の拡張バイトを確保しておくことで、"ダイアログ"として振る舞える）
+static ATOM Helper_RegisterClass(HINSTANCE hInstance)
+{
+	static ATOM s_atom = 0;
+	if (s_atom)
+		return s_atom;
+
+	WNDCLASSEXW wc = { sizeof(wc) };
+	wc.lpfnWndProc = DefDlgProcW;
+	wc.cbWndExtra = DLGWINDOWEXTRA;
+	wc.hInstance = hInstance;
+	wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+	wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
+	wc.lpszClassName = AIHELPERCONSOLE_CLASSNAME;
+
+	s_atom = RegisterClassExW(&wc);
+	return s_atom;
+}
+
+// オーナーウィンドウの中央に配置する（DS_CENTER相当）
+static void XgCenterWindow(HWND hwnd, HWND hwndOwner)
+{
+	RECT rcOwner, rcWnd;
+	if (!hwndOwner || !GetWindowRect(hwndOwner, &rcOwner))
+		GetWindowRect(GetDesktopWindow(), &rcOwner);
+	GetWindowRect(hwnd, &rcWnd);
+
+	int cx = rcWnd.right - rcWnd.left;
+	int cy = rcWnd.bottom - rcWnd.top;
+	int x = rcOwner.left + ((rcOwner.right - rcOwner.left) - cx) / 2;
+	int y = rcOwner.top + ((rcOwner.bottom - rcOwner.top) - cy) / 2;
+
+	SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+#define IDT_AI_OUTPUT_FLUSH 999
+
+#ifdef USE_PYTHON
+// 完全に起動されるまで待つ。
+// AIHelper(_ja).pyはコンソールサブシステムのPythonプロセスであり、GUIの
+// メッセージキューを持たないため、WaitForInputIdleでは起動完了を検知できない。
+// 代わりに、子プロセスが標準出力へ"[READY]"を吐いた時点でセットされる
+// イベントを待つ（Helper_ReaderThreadProc参照）。
+//
+// 注意: Helper_ReaderThreadProcはバナー等の各行をPostMessageWでこのスレッドの
+// メッセージキューに積むだけなので、単純にWaitForSingleObjectで待つと、
+// その間メッセージポンプが止まり、バナー行がまだ表示されていないうちに
+// （＝WM_APP_AI_LINEが処理されないうちに）呼び出し元がHelper_AskQuestionで
+// 質問エコーを直接Helper_AddLineしてしまい、表示順が
+// 「質問エコー→バナー」と入れ替わってしまう。
+// それを防ぐため、待機中もメッセージを汲み出して処理する。
+void Helper_WaitForReady(void)
+{
+	if (!xg_hReadyEvent)
+		return;
+
+	const DWORD dwStart = GetTickCount();
+	const DWORD dwTimeout = 20 * 1000; // 20秒
+
+	for (;;)
+	{
+		DWORD dwElapsed = GetTickCount() - dwStart;
+		if (dwElapsed >= dwTimeout)
+			break;
+
+		DWORD dwWait = MsgWaitForMultipleObjects(
+			1, &xg_hReadyEvent, FALSE, dwTimeout - dwElapsed, QS_ALLINPUT);
+
+		if (dwWait == WAIT_OBJECT_0)
+			break; // [READY]を受信した
+
+		if (dwWait != WAIT_OBJECT_0 + 1)
+			break; // タイムアウトまたはエラー
+
+		// キューにあるメッセージ（WM_APP_AI_LINEなど）を処理して、
+		// バナー行などが先に表示されるようにする
+		MSG msg;
+		while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+		{
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+	}
+
+	// イベントがシグナル状態になった後にもう届いているかもしれない
+	// メッセージ（バナーの残りなど）も、戻る前に処理しておく
+	MSG msg;
+	while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+	{
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
+	}
+}
+#else
+// AIクライアントがREADYになるまで待つ
+void Helper_WaitForReady(void)
+{
+	if (!xg_hReadyEvent)
+		return;
+
+	// 最大30秒待つ（通常はほぼ即座に返る）
+	DWORD dw = WaitForSingleObject(xg_hReadyEvent, 30000);
+
+	if (dw == WAIT_TIMEOUT) {
+		// タイムアウトした場合はログに出す（任意）
+		if (xg_hwndAIHelper) {
+			if (XgIsUserJapanese())
+				Helper_AddLine(xg_hwndAIHelper, L"[警告] AIの準備完了待ちがタイムアウトしました。");
+			else
+				Helper_AddLine(xg_hwndAIHelper, L"[Warning] Timed out waiting for AI to become ready.");
+		}
+	}
+}
+#endif // !def USE_PYTHON
 
 // 文字列中に含まれる "(*...*)" 形式のタグ（XG_GetAIPreTextによる前置情報など）を
 // すべて取り除いた文字列を返す。表示前のフィルタリング用。
-static std::wstring StripAiPreTextTag(LPCWSTR pszLine)
+static std::wstring Helper_StripAiPreTextTag(PCWSTR pszLine)
 {
 	std::wstring result;
 	const wchar_t *pch = pszLine;
@@ -72,9 +426,6 @@ static std::wstring StripAiPreTextTag(LPCWSTR pszLine)
 			if (pEnd)
 			{
 				pch = pEnd + 2;
-				// タグ直後の空白も1つ読み飛ばす（"(*...*) " のように付与されるため）
-				if (*pch == L' ')
-					++pch;
 				continue;
 			}
 		}
@@ -86,31 +437,35 @@ static std::wstring StripAiPreTextTag(LPCWSTR pszLine)
 }
 
 // lst1に1行追加し、末尾までスクロールする。
-// 横スクロールできるよう、必要に応じて水平スクロール範囲も広げる。
-static void AddLineToList(HWND hwnd, LPCWSTR pszLine)
+static void Helper_AddLine(HWND hwnd, PCWSTR pszLine)
 {
 	HWND hLst1 = GetDlgItem(hwnd, lst1);
 	if (!hLst1)
 		return;
 
 	// (*...*) タグを除去してから表示する
-	std::wstring filtered = StripAiPreTextTag(pszLine);
+	auto filtered = Helper_StripAiPreTextTag(pszLine);
 	if (filtered.empty())
 		return; // タグのみの行（プロンプト等）は表示しない
 
-	LPCWSTR pszDisplay = filtered.c_str();
+	// 既存のテキストの末尾にキャレットを置き、必要なら改行を付けてから追記する
+	int cchExisting = GetWindowTextLengthW(hLst1);
+	SendMessageW(hLst1, EM_SETSEL, (WPARAM)cchExisting, (LPARAM)cchExisting);
 
-	INT iIndex = (INT)SendMessageW(hLst1, LB_ADDSTRING, 0, (LPARAM)pszDisplay);
-	SendMessageW(hLst1, LB_SETTOPINDEX, (WPARAM)iIndex, 0);
+	std::wstring insert;
+	if (cchExisting > 0)
+		insert += L"\r\n";
+	insert += filtered;
 
-	int cxLine = MeasureLineWidth(hLst1, pszDisplay);
-	int cxExtent = (int)SendMessageW(hLst1, LB_GETHORIZONTALEXTENT, 0, 0);
-	if (cxLine + 10 > cxExtent)
-		SendMessageW(hLst1, LB_SETHORIZONTALEXTENT, (WPARAM)(cxLine + 10), 0);
+	SendMessageW(hLst1, EM_REPLACESEL, FALSE, (LPARAM)insert.c_str());
+
+	// 末尾までスクロールする
+	SendMessageW(hLst1, EM_SCROLLCARET, 0, 0);
 }
 
+#ifdef USE_PYTHON
 // UTF-8バイト列をUTF-16文字列に変換する
-static std::wstring Utf8ToWide(const char* psz, int cch)
+static std::wstring XgUtf8ToWide(const char* psz, int cch)
 {
 	if (cch <= 0)
 		return std::wstring();
@@ -123,60 +478,147 @@ static std::wstring Utf8ToWide(const char* psz, int cch)
 	MultiByteToWideChar(CP_UTF8, 0, psz, cch, &wstr[0], cchWide);
 	return wstr;
 }
+#endif
 
-static void DoSelectAll(HWND hwndList)
+static void Helper_SelectAll(HWND hwndEdit)
 {
-	SendMessageW(hwndList, LB_SETSEL, TRUE, -1);
+	SendMessageW(hwndEdit, EM_SETSEL, 0, -1);
 }
 
-static void DoCopyList(HWND hwndList)
+static void Helper_CopyList(HWND hwndEdit)
 {
-	INT nSelCount = (INT)SendMessageW(hwndList, LB_GETSELCOUNT, 0, 0);
-	if (nSelCount <= 0)
+	DWORD dwStart = 0, dwEnd = 0;
+	SendMessageW(hwndEdit, EM_GETSEL, (WPARAM)&dwStart, (LPARAM)&dwEnd);
+	if (dwStart == dwEnd)
+		return; // 選択範囲がなければ何もしない
+
+	// エディットコントロール標準のコピー処理に任せる
+	// （改行の扱いなどもOSがよしなにやってくれる）
+	SendMessageW(hwndEdit, WM_COPY, 0, 0);
+}
+
+// edt1の送信履歴（Helper_AskQuestionで送信するたびに追加される）
+static std::vector<std::wstring> xg_history;
+// 履歴内での現在位置。xg_history.size()なら「履歴を辿っていない（編集中）」状態
+static size_t xg_nHistoryIndex = 0;
+// 履歴を辿り始める直前に、edt1に入力されていた（まだ送信していない）文字列
+static std::wstring xg_historyPending;
+
+// 履歴に新しい入力を追加し、履歴位置を末尾（編集中）に戻す
+static void Helper_AddToHistory(PCWSTR pszText)
+{
+	if (!pszText || !*pszText)
 		return;
 
-	std::vector<int> selItems(nSelCount);
-	SendMessageW(hwndList, LB_GETSELITEMS, nSelCount, (LPARAM)selItems.data());
+	// 直前の履歴と同じ内容なら重複追加しない
+	if (xg_history.empty() || xg_history.back() != pszText)
+		xg_history.push_back(pszText);
 
-	std::wstring text;
-	for (INT i = 0; i < nSelCount; ++i)
-	{
-		INT idx = selItems[i];
-		INT len = (INT)SendMessageW(hwndList, LB_GETTEXTLEN, idx, 0);
-		if (len > 0)
-		{
-			std::wstring line;
-			line.resize(len + 1);
-			SendMessageW(hwndList, LB_GETTEXT, idx, (LPARAM)&line[0]);
-			line.resize(len);
-			text += line;
-			text += L"\r\n";
-		}
-	}
+	xg_nHistoryIndex = xg_history.size();
+	xg_historyPending.clear();
+}
 
-	if (text.empty())
+// edt1のテキストを置き換え、キャレットを末尾に移動する
+static void Helper_SetEdt1Text(HWND hwndEdit, const std::wstring &text)
+{
+	SetWindowTextW(hwndEdit, text.c_str());
+	SendMessageW(hwndEdit, EM_SETSEL, (WPARAM)text.size(), (LPARAM)text.size());
+}
+
+// エディットコントロールの全文を、長さの上限なしに取得する。
+// GetWindowTextLengthWで必要な長さを求めてからバッファを確保するため、
+// 固定長バッファ（WCHAR[512]等）のように入力が途中で切り詰められることがない。
+static std::wstring XgGetEditTextDynamic(HWND hwndEdit)
+{
+	int cch = GetWindowTextLengthW(hwndEdit);
+	if (cch <= 0)
+		return std::wstring();
+
+	std::wstring text(cch, L'\0');
+	// GetWindowTextWは終端NULを含めたバッファ長を求めるため+1して渡す
+	int cchCopied = GetWindowTextW(hwndEdit, &text[0], cch + 1);
+	text.resize((cchCopied > 0) ? (size_t)cchCopied : 0);
+	return text;
+}
+
+// 上矢印キー：一つ古い履歴へ
+static void Helper_HistoryGoBack(HWND hwndEdit)
+{
+	if (xg_history.empty() || xg_nHistoryIndex == 0)
 		return;
 
-	if (OpenClipboard(hwndList))
+	if (xg_nHistoryIndex == xg_history.size())
 	{
-		EmptyClipboard();
-		HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(WCHAR));
-		if (hMem)
-		{
-			PWSTR pMem = (PWSTR)GlobalLock(hMem);
-			StringCchCopyW(pMem, text.size() + 1, text.c_str());
-			GlobalUnlock(hMem);
-			SetClipboardData(CF_UNICODETEXT, hMem);
-			SendMessageW(hwndList, LB_SETSEL, FALSE, -1);
-		}
-		CloseClipboard();
+		// 履歴を辿り始める前に、今編集中の文字列を退避しておく
+		xg_historyPending = XgGetEditTextDynamic(hwndEdit);
 	}
+
+	--xg_nHistoryIndex;
+	Helper_SetEdt1Text(hwndEdit, xg_history[xg_nHistoryIndex]);
+}
+
+// 下矢印キー：一つ新しい履歴へ（末尾まで来たら退避しておいた編集中の文字列に戻す）
+static void Helper_HistoryGoForward(HWND hwndEdit)
+{
+	if (xg_nHistoryIndex >= xg_history.size())
+		return;
+
+	++xg_nHistoryIndex;
+	if (xg_nHistoryIndex == xg_history.size())
+		Helper_SetEdt1Text(hwndEdit, xg_historyPending);
+	else
+		Helper_SetEdt1Text(hwndEdit, xg_history[xg_nHistoryIndex]);
+}
+
+static WNDPROC g_fnOldEdt1WndProc = nullptr;
+
+// IMEの変換中（未確定文字列がある）かどうかを調べる。
+// 変換中に↑↓を履歴呼び出しへ横取りすると、変換候補選択と衝突してしまうため、
+// Helper_Edt1WndProcで判定に使う。
+static bool IsImeComposing(HWND hwnd)
+{
+	HIMC hIMC = ImmGetContext(hwnd);
+	if (!hIMC)
+		return false;
+
+	// 未確定文字列（コンポジション文字列）の長さを取得する。
+	// 0より大きければ変換中とみなせる。
+	LONG cbLen = ImmGetCompositionStringW(hIMC, GCS_COMPSTR, nullptr, 0);
+
+	ImmReleaseContext(hwnd, hIMC);
+
+	return cbLen > 0;
+}
+
+// edt1 用サブクラスウィンドウプロシージャ（↑↓キーで送信履歴を辿る）
+static LRESULT CALLBACK
+Helper_Edt1WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	switch (uMsg)
+	{
+	case WM_KEYDOWN:
+		if (wParam == VK_UP || wParam == VK_DOWN)
+		{
+			// IME変換中は候補選択を優先させ、履歴呼び出しは行わない
+			if (IsImeComposing(hwnd))
+				break;
+
+			if (wParam == VK_UP)
+				Helper_HistoryGoBack(hwnd);
+			else
+				Helper_HistoryGoForward(hwnd);
+			return 0;
+		}
+		break;
+	}
+	return CallWindowProcW(g_fnOldEdt1WndProc, hwnd, uMsg, wParam, lParam);
 }
 
 static WNDPROC g_fnOldLst1WndProc = nullptr;
 
 // lst1 用サブクラスウィンドウプロシージャ（Ctrl+C で選択行をコピー）
-static LRESULT CALLBACK Lst1WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+static LRESULT CALLBACK
+Helper_Lst1WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	switch (uMsg)
 	{
@@ -185,20 +627,31 @@ static LRESULT CALLBACK Lst1WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM 
 			break;
 		if (wParam == 'A') // Ctrl+A
 		{
-			DoSelectAll(hwnd);
+			Helper_SelectAll(hwnd);
 			return 0;
 		}
 		if (wParam == 'C') // Ctrl+C
 		{
-			DoCopyList(hwnd);
+			Helper_CopyList(hwnd);
 			return 0;
 		}
+		break;
+
+	case WM_MOUSEWHEEL: // Ctrl+ホイールでフォントサイズを変更する（ズーム）
+		if (GetKeyState(VK_CONTROL) < 0)
+		{
+			short zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+			Helper_OnZoom(GetParent(hwnd), (zDelta > 0) ? +1 : -1);
+			return 0;
+		}
+		break;
 	}
 	return CallWindowProcW(g_fnOldLst1WndProc, hwnd, uMsg, wParam, lParam);
 }
 
+#ifdef USE_PYTHON
 // UTF-16文字列をUTF-8バイト列に変換する
-static std::string WideToUtf8(LPCWSTR psz)
+static std::string XgWideToUtf8(PCWSTR psz)
 {
 	if (!psz || !*psz)
 		return std::string();
@@ -214,26 +667,40 @@ static std::string WideToUtf8(LPCWSTR psz)
 }
 
 // 子プロセスの出力を1行分、UIスレッドへ渡す（自スレッドから安全に呼べる）
-static void PostLineToUI(HWND hwnd, const std::wstring& line)
+static void Helper_PostLineToUI(HWND hwnd, const std::wstring& line)
 {
 	PWSTR psz = new WCHAR[line.size() + 1];
 	StringCchCopyW(psz, line.size() + 1, line.c_str());
-	PostMessageW(hwnd, WM_APP_AI_LINE, 0, (LPARAM)psz);
+	if (!PostMessageW(hwnd, WM_APP_AI_LINE, 0, (LPARAM)psz))
+		delete[] psz;
 }
 
-// g_hOutputReadを読み続け、行がまとまるたびにUIスレッドへ渡すバックグラウンドスレッド。
+// xg_hOutputReadを読み続け、行がまとまるたびにUIスレッドへ渡すバックグラウンドスレッド。
 // プロンプト文字列などの改行なしの断片も、しばらく新しいデータが来なければ
 // 1行として吐き出す（＝パイプが空になったタイミングでflushする）。
-static DWORD WINAPI ReaderThreadProc(LPVOID lpParam)
+// バッファから取り出した1行が起動完了シグナルであれば処理して true を返す。
+// このシグナルはHelper_WaitForReady専用の内部プロトコルなので、
+// UI（lst1）には表示しない。
+static bool HandlePossibleReadySignal(const std::string& line)
+{
+	if (line.find("[READY]") == line.npos)
+		return false;
+
+	if (xg_hReadyEvent)
+		SetEvent(xg_hReadyEvent);
+	return true;
+}
+
+static DWORD WINAPI Helper_ReaderThreadProc(LPVOID lpParam)
 {
 	HWND hwnd = (HWND)lpParam;
 	std::string buffer;
 	BYTE szBuf[1024];
 	DWORD cbAvail, cbRead;
 
-	while (!g_bReaderStop)
+	while (!xg_bReaderStop)
 	{
-		if (!g_hOutputRead.PeekNamedPipe(nullptr, 0, nullptr, &cbAvail))
+		if (!xg_hOutputRead.PeekNamedPipe(nullptr, 0, nullptr, &cbAvail))
 			break; // パイプが閉じられた（プロセス終了）
 
 		if (cbAvail == 0)
@@ -242,12 +709,13 @@ static DWORD WINAPI ReaderThreadProc(LPVOID lpParam)
 			// ここでいったん1行として出力しておく
 			if (!buffer.empty())
 			{
-				std::wstring wline = Utf8ToWide(buffer.c_str(), (int)buffer.size());
-				PostLineToUI(hwnd, wline);
+				HandlePossibleReadySignal(buffer);
+				auto wline = XgUtf8ToWide(buffer.c_str(), (int)buffer.size());
+				Helper_PostLineToUI(hwnd, wline);
 				buffer.clear();
 			}
 
-			if (!g_maker.IsRunning())
+			if (!xg_process_maker.IsRunning())
 				break;
 
 			Sleep(10);
@@ -257,19 +725,20 @@ static DWORD WINAPI ReaderThreadProc(LPVOID lpParam)
 		if (cbAvail > sizeof(szBuf))
 			cbAvail = sizeof(szBuf);
 
-		if (g_hOutputRead.ReadFile(szBuf, cbAvail, &cbRead) && cbRead > 0)
+		if (xg_hOutputRead.ReadFile(szBuf, cbAvail, &cbRead) && cbRead > 0)
 		{
 			buffer.append(reinterpret_cast<char*>(szBuf), cbRead);
 
 			size_t pos;
-			while ((pos = buffer.find('\n')) != std::string::npos)
+			while ((pos = buffer.find('\n')) != buffer.npos)
 			{
-				std::string line = buffer.substr(0, pos);
+				auto line = buffer.substr(0, pos);
 				if (!line.empty() && line.back() == '\r')
 					line.pop_back();
 
-				std::wstring wline = Utf8ToWide(line.c_str(), (int)line.size());
-				PostLineToUI(hwnd, wline);
+				HandlePossibleReadySignal(line);
+				auto wline = XgUtf8ToWide(line.c_str(), (int)line.size());
+				Helper_PostLineToUI(hwnd, wline);
 
 				buffer.erase(0, pos + 1);
 			}
@@ -279,240 +748,591 @@ static DWORD WINAPI ReaderThreadProc(LPVOID lpParam)
 	// プロセスが終了した後に残った断片も出力する
 	if (!buffer.empty())
 	{
-		std::wstring wline = Utf8ToWide(buffer.c_str(), (int)buffer.size());
-		PostLineToUI(hwnd, wline);
+		HandlePossibleReadySignal(buffer);
+		auto wline = XgUtf8ToWide(buffer.c_str(), (int)buffer.size());
+		Helper_PostLineToUI(hwnd, wline);
 	}
 
-	if (!g_bReaderStop)
-		PostLineToUI(hwnd, L"[AIプロセスが終了しました]");
+	if (!xg_bReaderStop)
+	{
+		if (XgIsUserJapanese())
+			Helper_PostLineToUI(hwnd, L"[AIプロセスが終了しました]");
+		else
+			Helper_PostLineToUI(hwnd, L"[The AI process has finished]");
+	}
+
+	// [READY]を送る前にプロセスが終了した場合、Helper_WaitForReadyが
+	// タイムアウトまで無駄に待ち続けないよう、念のためここでもイベントをセットする
+	if (xg_hReadyEvent)
+		SetEvent(xg_hReadyEvent);
 
 	return 0;
+}
+#endif // def USE_PYTHON
+
+// パイプは「1行=1メッセージ」のプロトコルなので、text/pre_text/追加指示に
+// 万一改行が含まれていても子プロセスのinput()が複数質問と誤認しないよう、
+// 改行を空白に潰してから連結する（呼び出し元の実装に依存しない防御策）。
+static std::wstring Helper_SanitizeString(const std::wstring& str)
+{
+	std::wstring result;
+	result.reserve(str.size());
+	for (wchar_t ch : str)
+	{
+		if (ch == L'\r' || ch == L'\n')
+			result += L' ';
+		else if (ch == L'\"')
+			result += L'\'';
+		else
+			result += ch;
+	}
+	return result;
+}
+
+static void Helper_PleaseWait(HWND hwnd)
+{
+	if (XgIsUserJapanese())
+		Helper_AddLine(hwnd, L"しばらくお待ちください...");
+	else
+		Helper_AddLine(hwnd, L"Please wait a moment...");
 }
 
 // AIHelper_ja.py を対話モードで一度だけ起動し、そのままプロセスを保持し続ける。
 // 以後の質問は同じプロセスの標準入力へ書き込むことで送る。
-static BOOL StartAIProcess(HWND hwnd)
+static BOOL Helper_StartAIProcess(HWND hwnd)
 {
+#ifdef USE_PYTHON
 	TCHAR path[MAX_PATH];
 	GetModuleFileNameW(nullptr, path, _countof(path));
 	PathRemoveFileSpecW(path);
-	if (PRIMARYLANGID(GetUserDefaultLangID()) == LANG_JAPANESE)
+	if (XgIsUserJapanese())
 		PathAppendW(path, L"AIHelper_ja.py");
 	else
 		PathAppendW(path, L"AIHelper.py");
 
-	std::wstring str;
-	str += L"python \"";
+	std::wstring str = L"python \"";
 	str += path;
-	str += L"\" --provider=gemini --model gemini-3.6-flash";
+	str += L"\" --provider=";
+	str += Helper_SanitizeString(xg_ai_provider);
+	str += L" --model ";
+	str += Helper_SanitizeString(xg_ai_model);
+	str += L" --no-logo";
+	if (xg_initial_question.size())
+	{
+		str += L" --question \"";
+		str += Helper_SanitizeString(xg_initial_question);
+		str += L"\"";
+	}
 
 	// 実行するコマンドをlst1に出力する
-	AddLineToList(hwnd, (L"> " + str).c_str());
+	Helper_AddLine(hwnd, (L"> " + str).c_str());
+	Helper_PleaseWait(hwnd);
 
 	// 環境変数をセットする。
 	SetEnvironmentVariableW(L"PYTHONIOENCODING", L"utf-8");
 
 	// 子プロセスのウィンドウを作成しない。
-	g_maker.SetCreationFlags(CREATE_NO_WINDOW);
+	xg_process_maker.SetCreationFlags(CREATE_NO_WINDOW);
 
-	if (!g_maker.PrepareForRedirect(&g_hInputWrite, &g_hOutputRead) ||
-		!g_maker.CreateProcessDx(nullptr, str.c_str()))
+	// 起動完了シグナル（[READY]）待ち用のイベントを用意する
+	// （手動リセット、初期状態は非シグナル）
+	if (!xg_hReadyEvent)
+		xg_hReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	else
+		ResetEvent(xg_hReadyEvent);
+
+	if (!xg_process_maker.PrepareForRedirect(&xg_hInputWrite, &xg_hOutputRead) ||
+		!xg_process_maker.CreateProcessDx(nullptr, str.c_str()))
 	{
-		AddLineToList(hwnd, L"[エラー] プロセスの起動に失敗しました。");
+		if (XgIsUserJapanese())
+			Helper_AddLine(hwnd, L"[エラー] プロセスの起動に失敗しました。");
+		else
+			Helper_AddLine(hwnd, L"[Error] Failed to start the process. ");
+		if (xg_hReadyEvent)
+			SetEvent(xg_hReadyEvent); // 起動失敗時に無駄に待たされないように
 		return FALSE;
 	}
 
-	g_bReaderStop = FALSE;
-	g_hReaderThread = CreateThread(nullptr, 0, ReaderThreadProc, hwnd, 0, nullptr);
+	xg_bReaderStop = FALSE;
+	xg_hReaderThread = CreateThread(nullptr, 0, Helper_ReaderThreadProc, hwnd, 0, nullptr);
 	return TRUE;
+#else
+	Helper_AddLine(hwnd, L"> (native C++ AI client)");
+	Helper_PleaseWait(hwnd);
+
+	if (!xg_hReadyEvent)
+		xg_hReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	else
+		ResetEvent(xg_hReadyEvent);
+
+	BOOL ok = Helper2_Start(hwnd);
+	if (ok && xg_hReadyEvent)
+		SetEvent(xg_hReadyEvent);   // ここでREADYを立てる
+	return ok;
+#endif
 }
 
 // 実行中のAIHelper_ja.pyプロセスを終了し、後片付けをする
-static void StopAIProcess()
+static void Helper_StopAIProcess(HWND hwnd)
 {
-	g_bReaderStop = TRUE;
+#ifdef USE_PYTHON
+	KillTimer(hwnd, IDT_AI_OUTPUT_FLUSH);
 
-	if (g_maker.IsRunning())
-		g_maker.TerminateProcess(0);
+	xg_bReaderStop = TRUE;
 
-	if (g_hReaderThread)
+	if (xg_process_maker.IsRunning())
+		xg_process_maker.TerminateProcess(0);
+
+	if (xg_hReaderThread)
 	{
-		WaitForSingleObject(g_hReaderThread, 2000);
-		CloseHandle(g_hReaderThread);
-		g_hReaderThread = nullptr;
+		WaitForSingleObject(xg_hReaderThread, 2000);
+		CloseHandle(xg_hReaderThread);
+		xg_hReaderThread = nullptr;
 	}
 
-	g_hInputWrite.CloseHandle();
-	g_hOutputRead.CloseHandle();
-	g_maker.CloseAll();
+	xg_hInputWrite.CloseHandle();
+	xg_hOutputRead.CloseHandle();
+	xg_process_maker.CloseAll();
+
+	if (xg_hReadyEvent)
+	{
+		CloseHandle(xg_hReadyEvent);
+		xg_hReadyEvent = nullptr;
+	}
+#else
+	KillTimer(hwnd, IDT_AI_OUTPUT_FLUSH);
+	Helper2_Stop();
+
+	if (xg_hReadyEvent) {
+		CloseHandle(xg_hReadyEvent);
+		xg_hReadyEvent = nullptr;
+	}
+#endif
 }
 
 // 起動済みのプロセスの標準入力へ質問を書き込む（プロセスは終了させない）
-void AskAIQuestion(HWND hwnd, PWSTR text)
+void Helper_AskQuestion(HWND hwnd, PCWSTR text)
 {
-	if (!g_maker.IsRunning())
+	if (!text || !text[0])
+		return;
+
+	// 前後の空白（全角空白含む）を除去する。長さの上限は設けない。
+	std::wstring str = text;
 	{
-		AddLineToList(hwnd, L"[エラー] AIプロセスが起動していません。");
+		const wchar_t szTrimChars[] = L" \t\r\n　";
+		size_t posStart = str.find_first_not_of(szTrimChars);
+		if (posStart == str.npos) {
+			str.clear();
+		} else {
+			size_t posEnd = str.find_last_not_of(szTrimChars);
+			str = str.substr(posStart, posEnd - posStart + 1);
+		}
+	}
+	if (str.empty())
+		return;
+
+	// 半角カッコと全角カッコ、まぎわらしいので半角に統一。
+	mstr_replace_all(str, L"［［", L"[[");
+	mstr_replace_all(str, L"〔〔", L"[[");
+	mstr_replace_all(str, L"］］", L"]]");
+	mstr_replace_all(str, L"〕〕", L"[[");
+
+	bool bIsCommand;
+	// 入力に「[[key:text]]」形式のシステムコマンドが含まれているかを判定する
+	// （実際の解析・適用と同じFindNextAICommandを使うことで、判定と実処理の
+	// ロジックがずれないようにする）。
+	{
+		size_t posScan = 0;
+		std::wstring key, text2;
+		bIsCommand = FindNextAICommand(str, posScan, key, text2);
+	}
+	if (bIsCommand) {
+		// 入力した質問をlst1にエコー表示する
+		Helper_AddLine(hwnd, (L"> " + str).c_str());
+		// 実行
+		XgParseAndApplyAICommand(str.c_str());
+		if (XgIsUserJapanese())
+			Helper_AddLine(hwnd, L"システムコマンドを実行しました。");
+		else
+			Helper_AddLine(hwnd, L"The system command has been executed. ");
 		return;
 	}
 
-	// 入力した質問をlst1にエコー表示する
-	AddLineToList(hwnd, (L"> " + std::wstring(text)).c_str());
-
-	std::wstring line;
-#ifdef XWORDGIVER
-	std::wstring XG_GetAIPreText();
-	std::wstring pre_text = XG_GetAIPreText();
-	line += L"(*";
-	line += pre_text;
-	line += L"*) ";
+#ifdef USE_PYTHON
+	if (!xg_process_maker.IsRunning()) {
+		if (XgIsUserJapanese())
+			Helper_AddLine(hwnd, L"[エラー] AIプロセスが起動していません。");
+		else
+			Helper_AddLine(hwnd, L"[Error] The AI process is not running. ");
+		return;
+	}
 #endif
-	line += text;
-	line += L"\n";
 
-	std::string utf8 = WideToUtf8(line.c_str());
+	// 入力した質問をlst1にエコー表示する
+	Helper_AddLine(hwnd, (L"> " + str).c_str());
+	Helper_PleaseWait(hwnd);
+
+	std::wstring line, pre_text = XG_GetAIPreText();
+	if (pre_text.size())
+	{
+		line += L"(* ";
+		line += Helper_SanitizeString(pre_text);
+		line += L" *) ";
+	}
+	line += str;
+	if (xg_additional_instruction.size())
+	{
+		line += L"(* ";
+		line += Helper_SanitizeString(xg_additional_instruction);
+		line += L" *)";
+	}
+
+#ifdef USE_PYTHON
+	line += L"\n"; // 重要！ Helper_ReaderThreadProcがこれを見る。この行に本物の改行はこの1文字だけ。
+
+	auto utf8 = XgWideToUtf8(line.c_str());
 
 	DWORD cbWritten;
-	if (!g_hInputWrite.WriteFile(utf8.data(), (DWORD)utf8.size(), &cbWritten))
+	if (!xg_hInputWrite.WriteFile(utf8.data(), (DWORD)utf8.size(), &cbWritten))
 	{
-		AddLineToList(hwnd, L"[エラー] AIプロセスへの送信に失敗しました。");
+		if (XgIsUserJapanese())
+			Helper_AddLine(hwnd, L"[エラー] AIプロセスへの送信に失敗しました。");
+		else
+			Helper_AddLine(hwnd, L"[Error] Failed to send to the AI process. ");
 	}
+#else
+	// C++版は改行不要
+	Helper2_Ask(hwnd, line);
+#endif
 }
 
-static BOOL OnInitDialog(HWND hwnd, HWND hwndFocus, LPARAM lParam)
+// lst1, edt1, IDOKの子コントロールを作成する。
+// IDD_AIHELPERCONSOLE (283x133 DU) と同じレイアウトを、DIALOGリソースを使わずに
+// 再現している。座標・スタイルはrcスクリプトの値をそのまま踏襲している。
+static void CreateAIHelperControls(HWND hwnd)
 {
-	g_hwndAIHelper = hwnd;
+	g_hFont = CreateAIHelperFont(hwnd, xg_nHelperFontPointSize);
 
-	// Subclassing lst1 (for Ctrl+C copy)
+	LONG baseUnitX, baseUnitY;
+	Helper_ComputeDialogBaseUnits(g_hFont, baseUnitX, baseUnitY);
+
+	auto X = [baseUnitX](LONG du) { return DuToPixelX(du, baseUnitX); };
+	auto Y = [baseUnitY](LONG du) { return DuToPixelY(du, baseUnitY); };
+
+	HWND hLst1 = CreateWindowExW(0, L"EDIT", nullptr,
+		WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL |
+		ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+		X(5), Y(7), X(270), Y(98),
+		hwnd, (HMENU)(INT_PTR)lst1, xg_hAIHelperInst, nullptr);
+
+	HWND hEdt1 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
+		WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+		X(6), Y(113), X(203), Y(14),
+		hwnd, (HMENU)(INT_PTR)edt1, xg_hAIHelperInst, nullptr);
+
+	HWND hOk = CreateWindowExW(0, L"BUTTON", L"Enter",
+		WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+		X(215), Y(112), X(60), Y(14),
+		hwnd, (HMENU)(INT_PTR)IDOK, xg_hAIHelperInst, nullptr);
+
+	SendMessageW(hLst1, WM_SETFONT, (WPARAM)g_hFont, FALSE);
+	SendMessageW(hEdt1, WM_SETFONT, (WPARAM)g_hFont, FALSE);
+	SendMessageW(hOk, WM_SETFONT, (WPARAM)g_hFont, FALSE);
+
+	// クライアント領域が283x133DU相当のサイズになるよう、ウィンドウ全体をリサイズする
+	RECT rc = { 0, 0, X(283), Y(133) };
+	AdjustWindowRectEx(&rc, (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE), FALSE,
+		(DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+	SetWindowPos(hwnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+		SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+	// Enterボタンを既定ボタンとして登録する
+	// （本来はダイアログマネージャがDEFPUSHBUTTONを見つけて自動的に行う処理）
+	SendMessageW(hwnd, DM_SETDEFID, IDOK, 0);
+
+	// ダイアログをリサイズ可能にする
+	xg_resizable.OnParentCreate(hwnd, TRUE, TRUE);
+	// lst1: ウィンドウのリサイズに合わせて幅・高さともに伸縮させる
+	xg_resizable.SetLayoutAnchor(lst1, mzcLA_TOP_LEFT, mzcLA_BOTTOM_RIGHT);
+	// edt1: 下端に張り付いたまま、幅だけ伸縮させる
+	xg_resizable.SetLayoutAnchor(edt1, mzcLA_BOTTOM_LEFT, mzcLA_BOTTOM_RIGHT);
+	// IDOK（Enterボタン）: サイズは固定のまま右下に追従させる
+	xg_resizable.SetLayoutAnchor(IDOK, mzcLA_BOTTOM_RIGHT);
+}
+
+// Ctrl+ホイールによるズーム。lst1/edt1/IDOKのフォントを一括で変更する。
+static void Helper_OnZoom(HWND hwndDlg, int nDelta)
+{
+	if (!hwndDlg)
+		return;
+
+	int nNewSize = xg_nHelperFontPointSize + nDelta;
+	if (nNewSize < g_nFontPointSizeMin)
+		nNewSize = g_nFontPointSizeMin;
+	if (nNewSize > g_nFontPointSizeMax)
+		nNewSize = g_nFontPointSizeMax;
+	if (nNewSize == xg_nHelperFontPointSize)
+		return;
+
+	HFONT hNewFont = CreateAIHelperFont(hwndDlg, nNewSize);
+	if (!hNewFont)
+		return;
+
+	xg_nHelperFontPointSize = nNewSize;
+
+	HWND hLst1 = GetDlgItem(hwndDlg, lst1);
+	HWND hEdt1 = GetDlgItem(hwndDlg, edt1);
+	HWND hOk = GetDlgItem(hwndDlg, IDOK);
+
+	if (hLst1)
+		SendMessageW(hLst1, WM_SETFONT, (WPARAM)hNewFont, TRUE);
+	if (hEdt1)
+		SendMessageW(hEdt1, WM_SETFONT, (WPARAM)hNewFont, TRUE);
+	if (hOk)
+		SendMessageW(hOk, WM_SETFONT, (WPARAM)hNewFont, TRUE);
+
+	HFONT hFontOld = g_hFont;
+	g_hFont = hNewFont;
+	if (hFontOld)
+		DeleteObject(hFontOld);
+}
+
+// WM_INITDIALOG
+static BOOL Helper_OnInitDialog(HWND hwnd, HWND hwndFocus, LPARAM lParam)
+{
+	// DIALOGリソースの代わりに、子コントロールをここで作成する
+	CreateAIHelperControls(hwnd);
+
+	// Subclassing lst1 (for Ctrl+A / Ctrl+C)
 	HWND hLst1 = GetDlgItem(hwnd, lst1);
-	g_fnOldLst1WndProc = (WNDPROC)SetWindowLongPtrW(hLst1, GWLP_WNDPROC, (LONG_PTR)Lst1WndProc);
+	g_fnOldLst1WndProc = (WNDPROC)SetWindowLongPtrW(hLst1, GWLP_WNDPROC, (LONG_PTR)Helper_Lst1WndProc);
+
+	// Subclassing edt1 (for ↑↓による送信履歴の呼び出し)
+	HWND hEdt1ForSubclass = GetDlgItem(hwnd, edt1);
+	g_fnOldEdt1WndProc = (WNDPROC)SetWindowLongPtrW(hEdt1ForSubclass, GWLP_WNDPROC, (LONG_PTR)Helper_Edt1WndProc);
+
+	// デフォルトの文字数上限（約64KB）を撤廃し、ログが長く伸びても追記できるようにする
+	SendMessageW(hLst1, EM_SETLIMITTEXT, 0, 0);
 
 	SetFocus(GetDlgItem(hwnd, edt1));
 
-	// ダイアログをリサイズ可能にする
-	g_resizable.OnParentCreate(hwnd, TRUE, TRUE);
-	// lst1: ウィンドウのリサイズに合わせて幅・高さともに伸縮させる
-	g_resizable.SetLayoutAnchor(lst1, mzcLA_TOP_LEFT, mzcLA_BOTTOM_RIGHT);
-	// edt1: 下端に張り付いたまま、幅だけ伸縮させる
-	g_resizable.SetLayoutAnchor(edt1, mzcLA_BOTTOM_LEFT, mzcLA_BOTTOM_RIGHT);
-	// IDOK（Enterボタン）: サイズは固定のまま右下に追従させる
-	g_resizable.SetLayoutAnchor(IDOK, mzcLA_BOTTOM_RIGHT);
-
 	// ダイアログの起動と同時にAIHelper_ja.pyを一度だけ起動し、
 	// ダイアログを閉じるまでプロセスを使い回す
-	StartAIProcess(hwnd);
+	Helper_StartAIProcess(hwnd);
+
+	// 前回の位置・サイズが保存されていれば、それを尊重して復元する。
+	// （CW_USEDEFAULTのままだとMoveWindowには渡せないため、保存値がある場合のみ移動する）
+	xg_hwndAIHelper = hwnd;
+	if (xg_nHelperX != CW_USEDEFAULT && xg_nHelperY != CW_USEDEFAULT &&
+		xg_nHelperCX != CW_USEDEFAULT && xg_nHelperCY != CW_USEDEFAULT)
+	{
+		MoveWindow(hwnd, xg_nHelperX, xg_nHelperY, xg_nHelperCX, xg_nHelperCY, TRUE);
+	}
 
 	return FALSE;
 }
 
-static VOID OnSize(HWND hwnd, UINT state, int cx, int cy)
+// WM_MOVE
+static void Helper_OnMove(HWND hwnd, int x, int y)
 {
-	g_resizable.OnSize();
+	if (!IsWindow(xg_hwndAIHelper))
+		return;
+
+	if (!IsZoomed(hwnd) && !IsIconic(hwnd)) // 最大化も最小化もされていない？
+	{
+		RECT rc;
+		GetWindowRect(hwnd, &rc);
+		xg_nHelperX = rc.left;
+		xg_nHelperY = rc.top;
+	}
+}
+
+// WM_SIZE
+static VOID Helper_OnSize(HWND hwnd, UINT state, int cx, int cy)
+{
+	if (!IsWindow(xg_hwndAIHelper))
+		return;
+
+	// サイズに合わせてダイアログ項目のレイアウト修正。
+	xg_resizable.OnSize();
+
+	if (!IsZoomed(hwnd) && !IsIconic(hwnd)) // 最大化も最小化もされていない？
+	{
+		RECT rc;
+		GetWindowRect(hwnd, &rc);
+		xg_nHelperCX = rc.right - rc.left;
+		xg_nHelperCY = rc.bottom - rc.top;
+	}
 }
 
 static BOOL OnOK(HWND hwnd)
 {
-	WCHAR text[512];
-	GetDlgItemTextW(hwnd, edt1, text, _countof(text));
-	if (text[0])
+	auto text = XgGetEditTextDynamic(GetDlgItem(hwnd, edt1));
+	if (!text.empty())
 	{
-		AskAIQuestion(hwnd, text);
+		Helper_AskQuestion(hwnd, text.c_str());
+		Helper_AddToHistory(text.c_str());
 		SetDlgItemTextW(hwnd, edt1, L"");
 	}
 	return FALSE;
 }
 
-static void OnCommand(HWND hwnd, int id, HWND hwndCtl, UINT codeNotify)
+// WM_COMMAND
+static void Helper_OnCommand(HWND hwnd, int id, HWND hwndCtl, UINT codeNotify)
 {
 	switch (id)
 	{
 	case IDOK:
 		if (OnOK(hwnd))
 		{
-			StopAIProcess();
-#ifdef AIHELPER_STANDALONE
-			EndDialog(hwnd, id);
-#else
+			Helper_StopAIProcess(hwnd);
 			DestroyWindow(hwnd);
-#endif
 		}
 		break;
 	case IDCANCEL:
-		StopAIProcess();
-#ifdef AIHELPER_STANDALONE
-		EndDialog(hwnd, id);
-#else
+		Helper_StopAIProcess(hwnd);
 		DestroyWindow(hwnd);
-#endif
 		break;
 	}
 }
 
-static void OnDestroy(HWND hwnd)
+// WM_DESTROY
+static void Helper_OnDestroy(HWND hwnd)
 {
-	StopAIProcess();
-	g_hwndAIHelper = nullptr;
-#ifdef AIHELPER_STANDALONE
+	Helper_StopAIProcess(hwnd);
+	xg_hwndAIHelper = nullptr;
+	xg_output_buffer.clear();
+	xg_resizable.ClearLayouts();
+
+	// 送信履歴もクリアする
+	xg_history.clear();
+	xg_nHistoryIndex = 0;
+	xg_historyPending.clear();
+
+	if (g_hFont)
+	{
+		DeleteObject(g_hFont);
+		g_hFont = nullptr;
+	}
+}
+
+// WM_CLOSE
+// IDCANCELに相当するボタンが存在しないため、Escキーやタイトルバーの閉じるボタンは
+// （IsDialogMessageWの既定処理により）WM_CLOSEとして届く。DefDlgProcは
+// WM_CLOSEを自動ではDestroyWindowしないので、ここで明示的に後始末する。
+static void Helper_OnClose(HWND hwnd)
+{
+	Helper_StopAIProcess(hwnd);
+	DestroyWindow(hwnd);
+#ifdef HELPER_STANDALONE
 	PostQuitMessage(0);
 #endif
 }
 
+// WM_TIMER
+static void Helper_OnTimer(HWND hwnd, UINT id)
+{
+	if (id != IDT_AI_OUTPUT_FLUSH)
+		return;
+
+	KillTimer(hwnd, IDT_AI_OUTPUT_FLUSH);
+
+	std::wstring text = std::move(xg_output_buffer);
+	xg_output_buffer.clear();
+
+	// テキストに含まれるシステムコマンドを実行する。
+	XgParseAndApplyAICommand(text.c_str());
+}
+
+// WM_GETMINMAXINFO: ウィンドウの大きさを制限する。
+static void Helper_OnGetMinMaxInfo(HWND hwnd, LPMINMAXINFO lpMinMaxInfo)
+{
+	lpMinMaxInfo->ptMinTrackSize.x = 100;
+	lpMinMaxInfo->ptMinTrackSize.y = 100;
+}
+
 static INT_PTR CALLBACK
-DialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+Helper_DialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	switch (uMsg)
 	{
-		HANDLE_MSG(hwnd, WM_INITDIALOG, OnInitDialog);
-		HANDLE_MSG(hwnd, WM_COMMAND, OnCommand);
-		HANDLE_MSG(hwnd, WM_SIZE, OnSize);
-		HANDLE_MSG(hwnd, WM_DESTROY, OnDestroy);
+		HANDLE_MSG(hwnd, WM_INITDIALOG, Helper_OnInitDialog);
+		HANDLE_MSG(hwnd, WM_COMMAND, Helper_OnCommand);
+		HANDLE_MSG(hwnd, WM_MOVE, Helper_OnMove);
+		HANDLE_MSG(hwnd, WM_SIZE, Helper_OnSize);
+		HANDLE_MSG(hwnd, WM_DESTROY, Helper_OnDestroy);
+		HANDLE_MSG(hwnd, WM_CLOSE, Helper_OnClose);
+		HANDLE_MSG(hwnd, WM_TIMER, Helper_OnTimer);
+		HANDLE_MSG(hwnd, WM_GETMINMAXINFO, Helper_OnGetMinMaxInfo);
 
 	case WM_APP_AI_LINE:
+		if (lParam)
 		{
-			// ReaderThreadProcがnewしたバッファを引き取って表示し、解放する
+			KillTimer(hwnd, IDT_AI_OUTPUT_FLUSH);
+
+			// Helper_ReaderThreadProcがnewしたバッファを引き取って表示し、解放する
 			PWSTR psz = (PWSTR)lParam;
-			AddLineToList(hwnd, psz);
+			Helper_AddLine(hwnd, psz);
+			xg_output_buffer += psz;
 			delete[] psz;
+
+			// デバウンス（debounce）パターン
+			SetTimer(hwnd, IDT_AI_OUTPUT_FLUSH, 300, nullptr);
 		}
 		return TRUE;
 	}
 	return 0;
 }
 
-BOOL OpenAIHelper(HWND hwndOwner, BOOL bOpen)
+// AIヘルパーを開く。
+BOOL Helper_Open(HWND hwndOwner)
 {
-	if (bOpen)
-	{
-		if (g_hwndAIHelper)
-		{
-			SetForegroundWindow(g_hwndAIHelper);
-			return TRUE;
-		}
+	if (xg_initial_question.empty())
+		xg_initial_question = XgMakeInitialQuestion();
 
-		return !!CreateDialogW(g_hAIHelperInst, MAKEINTRESOURCE(IDD_AIHELPERCONSOLE), hwndOwner, DialogProc);
+	if (xg_hwndAIHelper)
+	{
+		SetForegroundWindow(xg_hwndAIHelper);
+		return TRUE;
 	}
-	else
-	{
-		if (g_hwndAIHelper)
-		{
-			DestroyWindow(g_hwndAIHelper);
-			return TRUE;
-		}
 
+	Helper_RegisterClass(xg_hAIHelperInst);
+
+	PCWSTR pszCaption = XgIsUserJapanese() ? L"AI ヘルパー コンソール" : L"AI Helper Console";
+
+	// DIALOGリソース(IDD_AIHELPERCONSOLE)は使わず、通常のウィンドウとして作成する。
+	// STYLE/EXSTYLEはrcスクリプトのDS_CENTER|WS_POPUPWINDOW|WS_CAPTION|
+	// WS_THICKFRAME|WS_MAXIMIZEBOX / WS_EX_TOOLWINDOWをそのまま踏襲している
+	// （DS_CENTER相当の中央寄せは、作成後にXgCenterWindowで行う）。
+	HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, AIHELPERCONSOLE_CLASSNAME, pszCaption,
+		WS_POPUPWINDOW | WS_CAPTION | WS_THICKFRAME | WS_MAXIMIZEBOX,
+		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+		hwndOwner, nullptr, xg_hAIHelperInst, nullptr);
+	if (!hwnd)
 		return FALSE;
-	}
-}
 
-#ifdef AIHELPER_STANDALONE
-INT WINAPI
-WinMain(HINSTANCE   hInstance,
-        HINSTANCE   hPrevInstance,
-        LPSTR       lpCmdLine,
-        INT         nCmdShow)
-{
-	g_hAIHelperInst = hInstance;
-	InitCommonControls();
-	DialogBox(hInstance, MAKEINTRESOURCE(IDD_AIHELPERCONSOLE), nullptr, DialogProc);
-	return 0;
+	// このウィンドウを「ダイアログ」として振る舞わせる。
+	// CreateDialog系APIが内部で行っている処理（DLGPROCの登録とWM_INITDIALOGの
+	// 送信）を手動で再現している。以後はIsDialogMessageWによるTab移動・
+	// Enterでの既定ボタン起動・Escでの終了などがそのまま機能する。
+	SetWindowLongPtrW(hwnd, DWLP_DLGPROC, (LONG_PTR)Helper_DialogProc);
+	SendMessageW(hwnd, WM_INITDIALOG, (WPARAM)hwnd, 0);
+
+	// 中央揃え。
+	// 前回の位置・サイズ（xg_nHelperX/Y/CX/CY）が保存されている場合はそれを
+	// 尊重し、ここでの中央寄せは初回起動時（保存値が無い場合）のみ行う。
+	if (xg_nHelperX == CW_USEDEFAULT || xg_nHelperY == CW_USEDEFAULT ||
+		xg_nHelperCX == CW_USEDEFAULT || xg_nHelperCY == CW_USEDEFAULT)
+	{
+		XgCenterWindow(hwnd, hwndOwner);
+	}
+
+	// 画面からはみ出ないようにする。
+	PostMessageW(hwnd, DM_REPOSITION, 0, 0);
+
+	// 実際に表示。
+	ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+	UpdateWindow(hwnd);
+
+	return TRUE;
 }
-#endif

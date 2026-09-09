@@ -33,9 +33,20 @@ endif()
 
 ##############################################################################
 
+# option USE_PYTHON
+option(USE_PYTHON "Use Python" OFF)
+
+if(USE_PYTHON)
+    add_definitions(-DUSE_PYTHON)
+endif()
+
+message(STATUS "USE_PYTHON: ${USE_PYTHON}")
+
+##############################################################################
+
 # AIHelper.exe
-add_executable(AIHelper WIN32 AIHelper.cpp AIHelper.rc)
-target_compile_definitions(AIHelper PRIVATE UNICODE _UNICODE AIHELPER_STANDALONE)
-target_link_libraries(AIHelper comctl32 shlwapi)
+add_executable(AIHelper WIN32 AIHelper.cpp AIHelper2.cpp AIHelper.rc main.cpp)
+target_compile_definitions(AIHelper PRIVATE UNICODE _UNICODE HELPER_STANDALONE)
+target_link_libraries(AIHelper comctl32 imm32 shlwapi winhttp)
 
 ##############################################################################

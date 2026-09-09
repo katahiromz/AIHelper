@@ -2,8 +2,8 @@
 """
 AIHelper_ja.py
 --------------
-ChatGPT / Gemini / Claude / Grok / DeepSeek / Sakana AI を切り替えて
-質問できるシンプルなCLIプログラム。
+ChatGPT / Gemini / Claude / Grok / DeepSeek / Sakana AI / Qwen / Kimi /
+Mistral / Llama を切り替えて質問できるシンプルなCLIプログラム。
 
 主な機能:
   - 対話モードでは各プロバイダごとに会話履歴を保持
@@ -16,7 +16,7 @@ import argparse
 import os
 import sys
 
-PROVIDERS = ["chatgpt", "gemini", "claude", "grok", "deepseek", "sakana"]
+PROVIDERS = ["chatgpt", "gemini", "claude", "grok", "deepseek", "sakana", "qwen", "kimi", "mistral", "llama"]
 
 DEFAULT_MODELS = {
     "chatgpt": "gpt-4o-mini",
@@ -25,6 +25,10 @@ DEFAULT_MODELS = {
     "grok": "grok-4.6",
     "deepseek": "deepseek-v4-flash",
     "sakana": "sakana-namazu",
+    "qwen": "qwen3-max",
+    "kimi": "kimi-k3",
+    "mistral": "mistral-large-latest",
+    "llama": "llama-4-maverick",
 }
 
 DEFAULT_MAX_TOKENS = 1024
@@ -36,6 +40,10 @@ OPENAI_COMPATIBLE_CONFIG = {
     "grok": {"api_key_env": "XAI_API_KEY", "base_url": "https://api.x.ai/v1"},
     "deepseek": {"api_key_env": "DEEPSEEK_API_KEY", "base_url": "https://api.deepseek.com/v1"},
     "sakana": {"api_key_env": "SAKANA_API_KEY", "base_url": "https://api.sakana.ai/v1"},
+    "qwen": {"api_key_env": "DASHSCOPE_API_KEY", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
+    "kimi": {"api_key_env": "MOONSHOT_API_KEY", "base_url": "https://api.moonshot.ai/v1"},
+    "mistral": {"api_key_env": "MISTRAL_API_KEY", "base_url": "https://api.mistral.ai/v1"},
+    "llama": {"api_key_env": "LLAMA_API_KEY", "base_url": "https://api.llama.com/compat/v1"},
 }
 
 
@@ -245,7 +253,7 @@ class AIClient:
 
 def interactive_mode(client: AIClient, initial_provider: str, model_override: str = None,
                       max_tokens: int = None, temperature: float = None, stream: bool = False,
-                      initial_question: str = None):
+                      initial_question: str = None, no_logo: bool = False):
     provider = initial_provider
 
     # プロバイダごとに現在使用中のモデルを保持する。
@@ -257,17 +265,18 @@ def interactive_mode(client: AIClient, initial_provider: str, model_override: st
     if model_override:
         current_models[initial_provider] = model_override
 
-    print("=== 生成AI 質問プログラム ===")
-    print(f"利用可能なプロバイダ: {', '.join(PROVIDERS)}")
-    print(f"現在のプロバイダ: {provider}（モデル: {current_models[provider]}）")
-    if stream:
-        print("(ストリーミング出力: ON)")
-    print("『provider:gemini』のように入力するとプロバイダを切り替えられます。")
-    print("『model:モデル名』のように入力すると現在のプロバイダのモデルを切り替えられます。")
-    print("『model』だけ入力すると現在のモデルを表示します。")
-    print("『reset』でその時点のプロバイダの会話履歴をクリアします。")
-    print("『models』で現在のプロバイダの利用可能モデル一覧を表示します。")
-    print("『exit』または『quit』で終了します。\n")
+    if not no_logo:
+        print("=== 生成AI 質問プログラム ===")
+        print(f"利用可能なプロバイダ: {', '.join(PROVIDERS)}")
+        print(f"現在のプロバイダ: {provider}（モデル: {current_models[provider]}）")
+        if stream:
+            print("(ストリーミング出力: ON)")
+        print("『provider:gemini』のように入力するとプロバイダを切り替えられます。")
+        print("『model:モデル名』のように入力すると現在のプロバイダのモデルを切り替えられます。")
+        print("『model』だけ入力すると現在のモデルを表示します。")
+        print("『reset』でその時点のプロバイダの会話履歴をクリアします。")
+        print("『models』で現在のプロバイダの利用可能モデル一覧を表示します。")
+        print("『exit』または『quit』で終了します。\n")
 
     # Gemini はSDKのChatセッションが履歴を保持する。
     # それ以外のプロバイダは messages のリストを自前で蓄積する。
@@ -339,12 +348,13 @@ def interactive_mode(client: AIClient, initial_provider: str, model_override: st
     # プロセスを終了せず、そのまま通常の対話ループへ入り、
     # 続けて質問できるようにする。
     if initial_question:
-        print(f"[{provider} / {current_models[provider]}] 質問> {initial_question}")
+        print(f"[{provider} / {current_models[provider]}]")
+        print(f"> {initial_question}")
         ask_once(initial_question)
 
     while True:
         try:
-            user_input = input(f"[{provider} / {current_models[provider]}] 質問> ").strip()
+            user_input = input(f"[{provider} / {current_models[provider]}] [READY]").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n終了します。")
             break
@@ -412,7 +422,7 @@ def interactive_mode(client: AIClient, initial_provider: str, model_override: st
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ChatGPT / Gemini / Claude / Grok / DeepSeek / Sakana AI を切り替えて質問できるプログラム")
+    parser = argparse.ArgumentParser(description="ChatGPT / Gemini / Claude / Grok / DeepSeek / Sakana AI / Qwen / Kimi / Mistral / Llama を切り替えて質問できるプログラム")
     parser.add_argument(
         "--provider", "-p",
         choices=PROVIDERS,
@@ -455,6 +465,11 @@ def main():
         choices=PROVIDERS + ["all"],
         help="利用可能なモデル一覧を表示して終了。プロバイダ名を省略すると全プロバイダ分を表示。",
     )
+    parser.add_argument(
+        "--no-logo",
+        action="store_true",
+        help="起動時のバナーや使い方の案内を表示しない",
+    )
     args = parser.parse_args()
 
     client = AIClient()
@@ -477,7 +492,7 @@ def main():
     # 最初の質問として使い、その後はそのまま対話モードへ入って
     # 続けて質問できるようにする。
     interactive_mode(client, args.provider, args.model, args.max_tokens, args.temperature, args.stream,
-                      initial_question=args.question)
+                      initial_question=args.question, no_logo=args.no_logo)
 
 
 if __name__ == "__main__":
