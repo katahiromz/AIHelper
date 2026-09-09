@@ -1,4 +1,4 @@
-﻿// AIHelper.cpp --- XWordGiver AI Helper
+﻿// AIHelper.cpp --- AI Helper
 // Author: katahiromz
 // License: MIT
 #include "DetectLeaks.h"
@@ -221,7 +221,7 @@ std::wstring XgGetAIStatus_ja(void)
 	SYSTEMTIME st;
 	GetLocalTime(&st);
 
-	ret += L"ただいま";
+	ret += L"ただ今";
 	ret += std::to_wstring(st.wYear);
 	ret += L"年";
 	ret += std::to_wstring(st.wMonth);

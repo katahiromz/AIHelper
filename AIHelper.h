@@ -1,4 +1,4 @@
-﻿// AIHelper.h --- XWordGiver AI Helper
+﻿// AIHelper.h --- AI Helper
 // Author: katahiromz
 // License: MIT
 

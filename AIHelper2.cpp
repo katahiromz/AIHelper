@@ -1,4 +1,4 @@
-﻿// AIHelper2.cpp --- XWordGiver AI Helper (pure C++ / WinHTTP, no Python)
+﻿// AIHelper2.cpp --- AI Helper (pure C++ / WinHTTP)
 // Author: katahiromz + Grok
 // License: MIT
 #include "DetectLeaks.h"
