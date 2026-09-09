@@ -20,7 +20,6 @@ WinMain(HINSTANCE   hInstance,
 		return 0;
 	}
 
-
 	MSG msg;
 	while (GetMessageW(&msg, nullptr, 0, 0))
 	{
