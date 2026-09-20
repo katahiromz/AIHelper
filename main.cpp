@@ -20,6 +20,8 @@ WinMain(HINSTANCE   hInstance,
         LPSTR       lpCmdLine,
         INT         nCmdShow)
 {
+	xg_hAIHelperInst = hInstance;
+
 	if (!Helper_Open(nullptr))
 	{
 		MessageBoxA(nullptr, "AI Helper failed.", nullptr, MB_ICONERROR);
