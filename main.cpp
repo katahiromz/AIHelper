@@ -1,7 +1,13 @@
 // main.cpp --- AI Helper demo
 // Author: katahiromz
 // License: MIT
+#include <windows.h>
+#include <string>
+#include <map>
+#include <vector>
 #include "AIHelper.h"
+
+WCHAR xg_szUIFont[LF_FACESIZE] = L"";
 
 BOOL XgIsUserJapanese(VOID) noexcept
 {

@@ -1,11 +1,10 @@
-﻿// AIHelper.h --- AI Helper
+﻿// AIHelper.h --- XWordGiver AI Helper
 // Author: katahiromz
 // License: MIT
 
 #pragma once
 
-#include <windows.h>
-#include <string>
+#include <vector>
 
 extern HWND xg_hwndAIHelper;
 extern HINSTANCE xg_hAIHelperInst;
@@ -18,6 +17,8 @@ extern INT xg_nHelperX;
 extern INT xg_nHelperY;
 extern INT xg_nHelperCX;
 extern INT xg_nHelperCY;
+extern std::map<std::wstring, std::vector<std::wstring>> xg_knownAIModels;
+extern std::vector<std::wstring> xg_knownAIProviders;
 
 // 子プロセスの出力の1行をUIスレッドへ渡すためのカスタムメッセージ
 // (WPARAMは未使用、LPARAMはnewしたPWSTR。受け取った側でdelete[]すること)
@@ -25,3 +26,8 @@ extern INT xg_nHelperCY;
 
 BOOL Helper_Open(HWND hwndOwner);
 void Helper_AskQuestion(HWND hwnd, PCWSTR text);
+void Helper_AddLine(HWND hwnd, PCWSTR pszLine);
+BOOL XgIsUserJapanese(VOID) noexcept;
+
+BOOL Helper_GetAIModels(PCWSTR provider, std::vector<std::wstring>& models);
+BOOL Helper_GetAIProviders(std::vector<std::wstring>& providers);

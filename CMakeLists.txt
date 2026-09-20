@@ -45,7 +45,7 @@ message(STATUS "USE_PYTHON: ${USE_PYTHON}")
 ##############################################################################
 
 # AIHelper.exe
-add_executable(AIHelper WIN32 AIHelper.cpp AIHelper2.cpp AIHelper.rc main.cpp)
+add_executable(AIHelper WIN32 AIHelper.cpp AIHelper2.cpp AIHelper.rc AIModelsDat.cpp main.cpp)
 target_compile_definitions(AIHelper PRIVATE UNICODE _UNICODE HELPER_STANDALONE)
 target_link_libraries(AIHelper comctl32 imm32 shlwapi winhttp)
 

@@ -17,35 +17,99 @@ import argparse
 import os
 import sys
 
-PROVIDERS = ["chatgpt", "gemini", "claude", "grok", "deepseek", "sakana", "qwen", "kimi", "mistral", "llama"]
+def _find_ai_models_file():
+    """Look for AIModels.dat next to this script, then in the current directory."""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "AIModels.dat"),
+        os.path.join(os.getcwd(), "AIModels.dat"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "AIModels.dat が見つかりません。このスクリプトと同じフォルダに置いてください。 "
+        "(AIModels.dat not found; place it next to this script.)"
+    )
 
-DEFAULT_MODELS = {
-    "chatgpt": "gpt-4o-mini",
-    "gemini": "gemini-3.6-flash",
-    "claude": "claude-haiku-4-5-20251001",
-    "grok": "grok-4.6",
-    "deepseek": "deepseek-v4-flash",
-    "sakana": "sakana-namazu",
-    "qwen": "qwen3-max",
-    "kimi": "kimi-k3",
-    "mistral": "mistral-large-latest",
-    "llama": "llama-4-maverick",
-}
+
+def _build_base_url(host, port, path, use_https):
+    """Build an OpenAI-SDK base_url from PROVIDER_INFO fields.
+
+    Strips a trailing "/chat/completions" from path so the result is the
+    API root (e.g. https://api.x.ai/v1). Default ports (443/80) are omitted.
+    """
+    if not host:
+        return None
+    protocol = "https" if use_https else "http"
+    try:
+        port_num = int(port) if port else (443 if use_https else 80)
+    except ValueError:
+        port_num = 443 if use_https else 80
+    if (use_https and port_num == 443) or (not use_https and port_num == 80):
+        port_part = ""
+    else:
+        port_part = f":{port_num}"
+    base_path = path or ""
+    suffix = "/chat/completions"
+    if base_path.endswith(suffix):
+        base_path = base_path[: -len(suffix)]
+    return f"{protocol}://{host}{port_part}{base_path}"
+
+
+def _load_ai_models_dat():
+    """Parse AIModels.dat and build PROVIDERS / DEFAULT_MODELS / OPENAI_COMPATIBLE_CONFIG.
+
+    PROVIDERS is the ordered list of provider names from [PROVIDER_INFO]
+    (the order they appear in the file). DEFAULT_MODELS is derived from
+    the first model listed in each [MODELS:provider] section.
+    OPENAI_COMPATIBLE_CONFIG is derived from [PROVIDER_INFO] rows whose
+    isOpenAICompat flag is 1 (base_url is reconstructed from
+    host/port/path/useHttps). Non-OpenAI-compatible providers (google /
+    anthropic) are handled by dedicated SDK paths and are not entered
+    into OPENAI_COMPATIBLE_CONFIG.
+    """
+    providers = []
+    default_models = {}
+    openai_compat = {}
+    section = None
+
+    with open(_find_ai_models_file(), "r", encoding="utf-8-sig") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith(";"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1]
+                continue
+            if section == "PROVIDER_INFO":
+                key, _, value = line.partition("=")
+                key = key.strip()
+                fields = [f.strip() for f in value.split(",")]
+                if len(fields) < 8 or not key:
+                    continue
+                providers.append(key)  # appearance order = display order
+                api_key_env = fields[0]
+                host = fields[1]
+                port = fields[2]
+                path = fields[3]
+                is_openai_compat = fields[4] == "1"
+                use_https = fields[7] == "1"
+                if is_openai_compat:
+                    base_url = _build_base_url(host, port, path, use_https)
+                    openai_compat[key] = {
+                        "api_key_env": api_key_env,
+                        "base_url": base_url,
+                    }
+            elif section is not None and section.startswith("MODELS:"):
+                provider = section[len("MODELS:"):]
+                default_models.setdefault(provider, line)  # first model = default
+
+    return providers, default_models, openai_compat
+
+
+PROVIDERS, DEFAULT_MODELS, OPENAI_COMPATIBLE_CONFIG = _load_ai_models_dat()
 
 DEFAULT_MAX_TOKENS = 1024
-
-# Configuration for providers that use an OpenAI-compatible API
-# (Chat Completions). Only the base_url and the API key env var differ.
-OPENAI_COMPATIBLE_CONFIG = {
-    "chatgpt": {"api_key_env": "OPENAI_API_KEY", "base_url": None},
-    "grok": {"api_key_env": "XAI_API_KEY", "base_url": "https://api.x.ai/v1"},
-    "deepseek": {"api_key_env": "DEEPSEEK_API_KEY", "base_url": "https://api.deepseek.com/v1"},
-    "sakana": {"api_key_env": "SAKANA_API_KEY", "base_url": "https://api.sakana.ai/v1"},
-    "qwen": {"api_key_env": "DASHSCOPE_API_KEY", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
-    "kimi": {"api_key_env": "MOONSHOT_API_KEY", "base_url": "https://api.moonshot.ai/v1"},
-    "mistral": {"api_key_env": "MISTRAL_API_KEY", "base_url": "https://api.mistral.ai/v1"},
-    "llama": {"api_key_env": "LLAMA_API_KEY", "base_url": "https://api.llama.com/compat/v1"},
-}
 
 
 # --- Error message formatting (stateless, so this stays a module function) ---
@@ -142,9 +206,15 @@ class AIClient:
             from openai import OpenAI
 
             config = OPENAI_COMPATIBLE_CONFIG[provider]
-            api_key = os.environ.get(config["api_key_env"])
-            if not api_key:
-                raise RuntimeError(f"Environment variable {config['api_key_env']} is not set.")
+            if config["api_key_env"]:
+                api_key = os.environ.get(config["api_key_env"])
+                if not api_key:
+                    raise RuntimeError(f"Environment variable {config['api_key_env']} is not set.")
+            else:
+                # ローカルAI等、APIキー不要なプロバイダー。SDKにはダミー値を渡す。
+                # Local AI etc. that need no API key; the SDK still requires a
+                # non-empty string, so pass a placeholder.
+                api_key = "not-needed"
 
             client_kwargs = {"api_key": api_key}
             if config["base_url"]:
@@ -219,9 +289,9 @@ class AIClient:
             raise ValueError(f"Unknown provider: {provider} (choices: {', '.join(PROVIDERS)})")
         model = model or DEFAULT_MODELS[provider]
 
-        if provider == "gemini":
+        if provider == "google":
             return self.ask_gemini_single(prompt, model, max_tokens, temperature)
-        elif provider == "claude":
+        elif provider == "anthropic":
             return self.ask_claude([{"role": "user", "content": prompt}], model, max_tokens, temperature)
         else:
             return self.ask_openai_compatible(provider, [{"role": "user", "content": prompt}], model, max_tokens, temperature)
@@ -232,19 +302,19 @@ class AIClient:
             raise ValueError(f"Unknown provider: {provider} (choices: {', '.join(PROVIDERS)})")
         model = model or DEFAULT_MODELS[provider]
 
-        if provider == "gemini":
+        if provider == "google":
             yield from self.ask_gemini_single_stream(prompt, model, max_tokens, temperature)
-        elif provider == "claude":
+        elif provider == "anthropic":
             yield from self.ask_claude_stream([{"role": "user", "content": prompt}], model, max_tokens, temperature)
         else:
             yield from self.ask_openai_compatible_stream(provider, [{"role": "user", "content": prompt}], model, max_tokens, temperature)
 
     # --- Model listing ---
     def list_models(self, provider: str) -> list:
-        if provider == "gemini":
+        if provider == "google":
             client = self.get_gemini_client()
             return sorted(m.name.removeprefix("models/") for m in client.models.list())
-        elif provider == "claude":
+        elif provider == "anthropic":
             client = self.get_claude_client()
             return sorted(m.id for m in client.models.list())
         elif provider in OPENAI_COMPATIBLE_CONFIG:
@@ -284,17 +354,17 @@ def interactive_mode(client: AIClient, initial_provider: str, model_override: st
     # Gemini's SDK Chat session keeps history internally.
     # For every other provider, we accumulate a list of messages ourselves.
     gemini_chat_session = None
-    histories = {p: [] for p in PROVIDERS if p != "gemini"}
+    histories = {p: [] for p in PROVIDERS if p != "google"}
 
     def init_gemini_chat(model_name: str):
         try:
             return client.create_gemini_chat_session(model_name, temperature, max_tokens)
         except Exception as e:
-            print(describe_error("gemini", e))
+            print(describe_error("google", e))
             return None
 
-    if provider == "gemini":
-        gemini_chat_session = init_gemini_chat(current_models["gemini"])
+    if provider == "google":
+        gemini_chat_session = init_gemini_chat(current_models["google"])
 
     def ask_once(user_input: str):
         """Send one question to the current provider/model and print the answer.
@@ -307,7 +377,7 @@ def interactive_mode(client: AIClient, initial_provider: str, model_override: st
         try:
             current_model = current_models[provider]
 
-            if provider == "gemini":
+            if provider == "google":
                 if gemini_chat_session is None:
                     gemini_chat_session = init_gemini_chat(current_model)
 
@@ -327,7 +397,7 @@ def interactive_mode(client: AIClient, initial_provider: str, model_override: st
                 if stream:
                     print()
                     answer_parts = []
-                    if provider == "claude":
+                    if provider == "anthropic":
                         gen = client.ask_claude_stream(history, current_model, max_tokens, temperature)
                     else:
                         gen = client.ask_openai_compatible_stream(provider, history, current_model, max_tokens, temperature)
@@ -337,7 +407,7 @@ def interactive_mode(client: AIClient, initial_provider: str, model_override: st
                     print("\n")
                     history.append({"role": "assistant", "content": "".join(answer_parts)})
                 else:
-                    if provider == "claude":
+                    if provider == "anthropic":
                         answer = client.ask_claude(history, current_model, max_tokens, temperature)
                     else:
                         answer = client.ask_openai_compatible(provider, history, current_model, max_tokens, temperature)
@@ -370,8 +440,8 @@ def interactive_mode(client: AIClient, initial_provider: str, model_override: st
             break
 
         if user_input.lower() == "reset":
-            if provider == "gemini":
-                gemini_chat_session = init_gemini_chat(current_models["gemini"])
+            if provider == "google":
+                gemini_chat_session = init_gemini_chat(current_models["google"])
             else:
                 histories[provider] = []
             print(f"-> Cleared conversation history for {provider}.\n")
@@ -390,7 +460,7 @@ def interactive_mode(client: AIClient, initial_provider: str, model_override: st
             current_models[provider] = new_model
             print(f"-> Switched {provider}'s model to {new_model}.")
 
-            if provider == "gemini":
+            if provider == "google":
                 # Gemini ties the model to the session, so switching models
                 # also resets the conversation history.
                 gemini_chat_session = init_gemini_chat(new_model)
@@ -415,8 +485,8 @@ def interactive_mode(client: AIClient, initial_provider: str, model_override: st
                 provider = new_provider
                 print(f"-> Switched to provider {provider} (model: {current_models[provider]}).\n")
 
-                if provider == "gemini" and gemini_chat_session is None:
-                    gemini_chat_session = init_gemini_chat(current_models["gemini"])
+                if provider == "google" and gemini_chat_session is None:
+                    gemini_chat_session = init_gemini_chat(current_models["google"])
             else:
                 print(f"-> Unknown provider (choices: {', '.join(PROVIDERS)})\n")
             continue
@@ -429,8 +499,8 @@ def main():
     parser.add_argument(
         "--provider", "-p",
         choices=PROVIDERS,
-        default="gemini",
-        help="Which AI provider to use (default: gemini)",
+        default="google",
+        help="Which AI provider to use (default: google)",
     )
     parser.add_argument(
         "--model", "-m",

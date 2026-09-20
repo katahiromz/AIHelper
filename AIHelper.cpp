@@ -1,25 +1,26 @@
-﻿// AIHelper.cpp --- AI Helper
+﻿// AIHelper.cpp --- XWordGiver AI Helper
 // Author: katahiromz
 // License: MIT
 #include "DetectLeaks.h"
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
-#include <tchar.h>
 #include <shlwapi.h>
 #include <imm.h>
+#include <tchar.h>
 #include <string>
 #include <vector>
+#include <map>
 #include <memory>
-#include <cassert>
 #include <strsafe.h>
+#include <cstdio>
 #ifdef USE_PYTHON
 	#include "MFile.hpp"
 	#include "MProcessMaker.hpp"
 #else
 	#include "AIHelper2.h"
 #endif
-#include "MString.hpp"
+#include "AIModelsDat.h"
 #include "MResizable.hpp"
 #include "AIHelper.h"
 #include "resource.h"
@@ -43,7 +44,8 @@ static volatile BOOL xg_bReaderStop = FALSE;
 static HANDLE        xg_hReadyEvent = nullptr;
 
 HWND xg_hwndAIHelper = nullptr;
-std::wstring xg_ai_provider = L"gemini";
+HBITMAP g_hbmFairy = nullptr;
+std::wstring xg_ai_provider = L"google";
 std::wstring xg_ai_model = L"gemini-3.6-flash";
 std::wstring xg_additional_instruction;
 std::wstring xg_output_buffer;
@@ -55,11 +57,13 @@ INT xg_nHelperY = CW_USEDEFAULT;
 INT xg_nHelperCX = CW_USEDEFAULT;
 INT xg_nHelperCY = CW_USEDEFAULT;
 
-BOOL XgIsUserJapanese(VOID) noexcept;
+int g_nRedBalls = 2;
+int g_nBlueBalls = 2;
+
 BOOL Helper_Open(HWND hwndOwner);
 void Helper_WaitForReady(void);
 void Helper_AskQuestion(HWND hwnd, PCWSTR text);
-static void Helper_AddLine(HWND hwnd, PCWSTR pszLine);
+void Helper_AddLine(HWND hwnd, PCWSTR pszLine);
 
 //////////////////////////////////////////////////////////////////////////////
 // DIALOGリソースを使わずに、ダイアログと同じ操作性（Tab移動、Enterで既定ボタン、
@@ -82,6 +86,9 @@ static HFONT g_hFont = nullptr;
 
 static void Helper_OnZoom(HWND hwndDlg, int nDelta);
 
+// UIフォント。
+extern WCHAR xg_szUIFont[LF_FACESIZE];
+
 // 現在の言語・ズーム設定に応じたフォントを作る（呼び出し側でDeleteObjectすること）
 static HFONT CreateAIHelperFont(HWND hwnd, int nPointSize)
 {
@@ -97,8 +104,7 @@ static HFONT CreateAIHelperFont(HWND hwnd, int nPointSize)
 	lf.lfOutPrecision = OUT_DEFAULT_PRECIS;
 	lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
 	lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
-	StringCchCopyW(lf.lfFaceName, _countof(lf.lfFaceName),
-		XgIsUserJapanese() ? L"MS UI Gothic" : L"Tahoma");
+	StringCchCopyW(lf.lfFaceName, _countof(lf.lfFaceName), xg_szUIFont);
 
 	return CreateFontIndirectW(&lf);
 }
@@ -106,8 +112,13 @@ static HFONT CreateAIHelperFont(HWND hwnd, int nPointSize)
 // 最初の質問を作成する。
 std::wstring XgMakeInitialQuestion_ja(void)
 {
-	// TODO: 編集せよ
 	std::wstring str = L"(* "
+		L"あなたは「妖精」です。誰かをを助けるのがあなたの役目です。"
+		L"あなたの母語は日本語です。"
+
+		L"あなたのコマンド出力「[[Rn]]」で赤いボールをn個増やすことができます(nは自然数)。"
+		L"あなたのコマンド出力「[[Bm]]」で青いボールをm個増やすことができます(mは自然数)。"
+
 		L"まずは60字程度のあいさつをして、あなたができることを簡単に説明してください。"
 	L"*) ";
 	return str;
@@ -116,8 +127,13 @@ std::wstring XgMakeInitialQuestion_ja(void)
 // Create the first question.
 std::wstring XgMakeInitialQuestion_en(void)
 {
-	// TODO: Do edit
 	std::wstring str = L"(* "
+		L"You are the \"Fairy\". Your job is to help somebody. "
+		L"Your native language is English. "
+
+		L"You can increase the number of red balls by n by outputting the command '[[Rn]]' (where n is a natural number)." 
+		L"You can increase the number of blue balls by m by outputting the command '[[Bm]]' (where m is a natural number)."
+
 		L"First, please provide a greeting of around 60 characters and briefly explain what you can do. "
 	L"*) ";
 	return str;
@@ -155,12 +171,16 @@ std::wstring XG_GetAIPreText(void)
 	return XgIsUserJapanese() ? XG_GetAIPreText_ja() : XG_GetAIPreText_en();
 }
 
-// 文字列lineのpos以降から、「[[key:text]]」形式のシステムコマンドを1つ探す。
-// key/textが空の[[ ]]（コマンドの体をなしていないもの）は読み飛ばして次を探す。
+// 文字列lineのpos以降から、「[[...]]」形式のシステムコマンドを1つ探す。
+// textが空の[[ ]]（コマンドの体をなしていないもの）は読み飛ばして次を探す。
 // 見つかった場合はkey/textに分解してtrueを返し、posを閉じ括弧「]]」の次の位置まで
 // 進める（＝呼び出し側はそのままposを使って次のFindNextAICommand呼び出しへ進める）。
 // 見つからなければfalseを返す。
-static bool FindNextAICommand(const std::wstring& line, size_t& pos, std::wstring& outKey, std::wstring& outText)
+//
+// 「[[...]]」の解析（XgParseAndApplyAICommand）と、Helper_AskQuestionでの
+// 「入力にシステムコマンドが含まれているか」の判定は、どちらも
+// 本質的に同じ処理（コマンドを1つ読み取れるか）なので、ここに集約する。
+static bool FindNextAICommand(const std::wstring& line, size_t& pos, std::wstring& text)
 {
 	for (;;) {
 		// [[と]]を探す
@@ -170,30 +190,40 @@ static bool FindNextAICommand(const std::wstring& line, size_t& pos, std::wstrin
 		size_t closePos = line.find(L"]]", openPos + 2);
 		if (closePos == line.npos)
 			return false;
+		pos = closePos + 2;
 
 		// [[ ]]の内側
 		auto inner = line.substr(openPos + 2, closePos - openPos - 2);
-		pos = closePos + 2;
-
-		// "...:..." の形式を期待する。
-		size_t colonPos = inner.find(L':');
-		if (colonPos == inner.npos)
-			colonPos = inner.find((wchar_t)0xFF1A); // 全角の '：'
-		if (colonPos == inner.npos)
-			continue; // コマンドの形式でない[[ ]]は読み飛ばす
-
-		auto key = inner.substr(0, colonPos);
-		auto text = inner.substr(colonPos + 1);
-		if (key.empty() || text.empty())
+		if (inner.empty()) {
 			continue;
+		}
 
-		outKey = std::move(key);
-		outText = std::move(text);
+		text = std::move(inner);
 		return true;
 	}
 }
 
-// AIヘルパーからの出力行を解析し、「[[...:...]]」形式の
+static void Helper_StopAIProcess(HWND hwnd);
+static void Helper_PleaseWait(HWND hwnd);
+
+// 文字列を置換する。
+bool xg_str_replace_all(std::wstring& s, const std::wstring& from, const std::wstring& to)
+{
+    std::wstring t;
+    size_t i = 0;
+    bool ret = false;
+    while ((i = s.find(from, i)) != s.npos) {
+        t = s.substr(0, i);
+        t += to;
+        t += s.substr(i + from.size());
+        s = t;
+        i += to.size();
+        ret = true;
+    }
+    return ret;
+}
+
+// AIヘルパーからの出力行を解析し、「[[...]]」形式の
 // コマンドを見つけたら、該当するカギ文章を書き換える。
 // 1行に複数のコマンドが含まれていてもすべて処理する。
 void CALLBACK XgParseAndApplyAICommand(PCWSTR pszLine)
@@ -202,14 +232,60 @@ void CALLBACK XgParseAndApplyAICommand(PCWSTR pszLine)
 	size_t pos = 0;
 
 	// 半角カッコと全角カッコ、まぎわらしいので半角に統一。
-	mstr_replace_all(line, L"［［", L"[[");
-	mstr_replace_all(line, L"〔〔", L"[[");
-	mstr_replace_all(line, L"］］", L"]]");
-	mstr_replace_all(line, L"〕〕", L"[[");
+	xg_str_replace_all(line, L"［［", L"[[");
+	xg_str_replace_all(line, L"〔〔", L"[[");
+	xg_str_replace_all(line, L"］］", L"]]");
+	xg_str_replace_all(line, L"〕〕", L"[[");
 
-	std::wstring key, text;
-	while (FindNextAICommand(line, pos, key, text)) {
-		// TODO: ここでシステムコマンドを処理する。
+	bool bChanged = false;
+
+	std::wstring text;
+	while (FindNextAICommand(line, pos, text)) {
+		WCHAR chType = text[0];
+		BOOL bRed = FALSE, bBlue = FALSE;
+		if (chType == L'R' || chType == L'r' || chType == L'Ｒ' || chType == L'ｒ')
+		{
+			bRed = TRUE;
+		}
+		else if (chType == L'B' || chType == L'b' || chType == L'Ｂ' || chType == L'ｂ')
+		{
+			bBlue = TRUE;
+		}
+		else
+			continue;
+
+		// 残り部分がすべて数字であることを確認し、番号を取得する。
+		auto numPart = text.substr(1);
+		if (numPart.empty())
+			continue;
+		bool bAllDigits = true;
+		for (wchar_t ch : numPart) {
+			if (ch < L'0' || L'9' < ch) {
+				bAllDigits = false;
+				break;
+			}
+		}
+		if (!bAllDigits)
+			continue;
+
+		// 番号
+		INT nNumber = _wtoi(numPart.c_str());
+
+		if (bRed) {
+			g_nRedBalls += nNumber;
+			bChanged = true;
+			continue;
+		}
+		if (bBlue) {
+			g_nBlueBalls += nNumber;
+			bChanged = true;
+			continue;
+		}
+	}
+
+	if (bChanged) {
+		std::wstring str = XgGetAIStatus();
+		Helper_AddLine(xg_hwndAIHelper, str.c_str());
 	}
 }
 
@@ -218,22 +294,11 @@ std::wstring XgGetAIStatus_ja(void)
 {
 	std::wstring ret;
 
-	SYSTEMTIME st;
-	GetLocalTime(&st);
-
-	ret += L"ただ今";
-	ret += std::to_wstring(st.wYear);
-	ret += L"年";
-	ret += std::to_wstring(st.wMonth);
-	ret += L"月";
-	ret += std::to_wstring(st.wDay);
-	ret += L"日";
-	ret += std::to_wstring(st.wHour);
-	ret += L"時";
-	ret += std::to_wstring(st.wMinute);
-	ret += L"分";
-	ret += std::to_wstring(st.wSecond);
-	ret += L"秒です。";
+	ret += L"現在、赤いボールが ";
+	ret += std::to_wstring(g_nRedBalls);
+	ret += L" 個、青いボールが ";
+	ret += std::to_wstring(g_nBlueBalls);
+	ret += L" 個あります。";
 
 	return ret;
 }
@@ -243,22 +308,11 @@ std::wstring XgGetAIStatus_en(void)
 {
 	std::wstring ret;
 
-	SYSTEMTIME st;
-	GetLocalTime(&st);
-
-	ret += L"Now, it's ";
-	ret += std::to_wstring(st.wYear);
-	ret += L"-";
-	ret += std::to_wstring(st.wMonth);
-	ret += L"-";
-	ret += std::to_wstring(st.wDay);
-	ret += L" ";
-	ret += std::to_wstring(st.wHour);
-	ret += L":";
-	ret += std::to_wstring(st.wMinute);
-	ret += L":";
-	ret += std::to_wstring(st.wSecond);
-	ret += L".";
+	ret += L"Currently, there are ";
+	ret += std::to_wstring(g_nRedBalls);
+	ret += L" red ball(s) and ";
+	ret += std::to_wstring(g_nBlueBalls);
+	ret += L" blue ball(s). ";
 
 	return ret;
 }
@@ -437,7 +491,7 @@ static std::wstring Helper_StripAiPreTextTag(PCWSTR pszLine)
 }
 
 // lst1に1行追加し、末尾までスクロールする。
-static void Helper_AddLine(HWND hwnd, PCWSTR pszLine)
+void Helper_AddLine(HWND hwnd, PCWSTR pszLine)
 {
 	HWND hLst1 = GetDlgItem(hwnd, lst1);
 	if (!hLst1)
@@ -857,7 +911,17 @@ static BOOL Helper_StartAIProcess(HWND hwnd)
 	xg_hReaderThread = CreateThread(nullptr, 0, Helper_ReaderThreadProc, hwnd, 0, nullptr);
 	return TRUE;
 #else
-	Helper_AddLine(hwnd, L"> (native C++ AI client)");
+	std::wstring line;
+	if (XgIsUserJapanese()) {
+		line += L"[システム] AIモデル「";
+		line += xg_ai_model;
+		line += L"」の言霊を召喚中...";
+	} else {
+		line += L"[System] Summoning the spirit of AI ​​model '";
+		line += xg_ai_model;
+		line += L"'... ";
+	}
+	Helper_AddLine(hwnd, line.c_str());
 	Helper_PleaseWait(hwnd);
 
 	if (!xg_hReadyEvent)
@@ -932,19 +996,19 @@ void Helper_AskQuestion(HWND hwnd, PCWSTR text)
 		return;
 
 	// 半角カッコと全角カッコ、まぎわらしいので半角に統一。
-	mstr_replace_all(str, L"［［", L"[[");
-	mstr_replace_all(str, L"〔〔", L"[[");
-	mstr_replace_all(str, L"］］", L"]]");
-	mstr_replace_all(str, L"〕〕", L"[[");
+	xg_str_replace_all(str, L"［［", L"[[");
+	xg_str_replace_all(str, L"〔〔", L"[[");
+	xg_str_replace_all(str, L"］］", L"]]");
+	xg_str_replace_all(str, L"〕〕", L"[[");
 
 	bool bIsCommand;
-	// 入力に「[[key:text]]」形式のシステムコマンドが含まれているかを判定する
+	// 入力に「[[...]]」形式のシステムコマンドが含まれているかを判定する
 	// （実際の解析・適用と同じFindNextAICommandを使うことで、判定と実処理の
 	// ロジックがずれないようにする）。
 	{
 		size_t posScan = 0;
-		std::wstring key, text2;
-		bIsCommand = FindNextAICommand(str, posScan, key, text2);
+		std::wstring text2;
+		bIsCommand = FindNextAICommand(str, posScan, text2);
 	}
 	if (bIsCommand) {
 		// 入力した質問をlst1にエコー表示する
@@ -952,9 +1016,9 @@ void Helper_AskQuestion(HWND hwnd, PCWSTR text)
 		// 実行
 		XgParseAndApplyAICommand(str.c_str());
 		if (XgIsUserJapanese())
-			Helper_AddLine(hwnd, L"システムコマンドを実行しました。");
+			Helper_AddLine(hwnd, L"[システム] システムコマンドを実行しました。");
 		else
-			Helper_AddLine(hwnd, L"The system command has been executed. ");
+			Helper_AddLine(hwnd, L"[System] The system command has been executed. ");
 		return;
 	}
 
@@ -1016,18 +1080,28 @@ static void CreateAIHelperControls(HWND hwnd)
 	LONG baseUnitX, baseUnitY;
 	Helper_ComputeDialogBaseUnits(g_hFont, baseUnitX, baseUnitY);
 
+	// イメージを読み込み
+	g_hbmFairy = LoadBitmapW(xg_hAIHelperInst, MAKEINTRESOURCEW(4));
+	BITMAP bm;
+	GetObjectW(g_hbmFairy, sizeof(bm), &bm);
+
 	auto X = [baseUnitX](LONG du) { return DuToPixelX(du, baseUnitX); };
 	auto Y = [baseUnitY](LONG du) { return DuToPixelY(du, baseUnitY); };
 
 	HWND hLst1 = CreateWindowExW(0, L"EDIT", nullptr,
 		WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL |
 		ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-		X(5), Y(7), X(270), Y(98),
+		X(5), Y(7), X(270), Y(92),
 		hwnd, (HMENU)(INT_PTR)lst1, xg_hAIHelperInst, nullptr);
+
+	HWND hStc1 = CreateWindowExW(0, L"STATIC", nullptr,
+		WS_CHILD | WS_VISIBLE | SS_BITMAP,
+		X(5), Y(100), X(20), Y(20),
+		hwnd, (HMENU)(INT_PTR)stc1, xg_hAIHelperInst, nullptr);
 
 	HWND hEdt1 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
 		WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-		X(6), Y(113), X(203), Y(14),
+		X(35), Y(112), X(170), Y(14),
 		hwnd, (HMENU)(INT_PTR)edt1, xg_hAIHelperInst, nullptr);
 
 	HWND hOk = CreateWindowExW(0, L"BUTTON", L"Enter",
@@ -1038,6 +1112,12 @@ static void CreateAIHelperControls(HWND hwnd)
 	SendMessageW(hLst1, WM_SETFONT, (WPARAM)g_hFont, FALSE);
 	SendMessageW(hEdt1, WM_SETFONT, (WPARAM)g_hFont, FALSE);
 	SendMessageW(hOk, WM_SETFONT, (WPARAM)g_hFont, FALSE);
+
+	// hStc1のサイズを調整。
+	RECT rc2;
+	GetWindowRect(hStc1, &rc2);
+	MapWindowRect(nullptr, hwnd, &rc2);
+	MoveWindow(hStc1, rc2.left, rc2.top, bm.bmWidth, bm.bmHeight, TRUE);
 
 	// クライアント領域が283x133DU相当のサイズになるよう、ウィンドウ全体をリサイズする
 	RECT rc = { 0, 0, X(283), Y(133) };
@@ -1054,10 +1134,15 @@ static void CreateAIHelperControls(HWND hwnd)
 	xg_resizable.OnParentCreate(hwnd, TRUE, TRUE);
 	// lst1: ウィンドウのリサイズに合わせて幅・高さともに伸縮させる
 	xg_resizable.SetLayoutAnchor(lst1, mzcLA_TOP_LEFT, mzcLA_BOTTOM_RIGHT);
+	// stc1
+	xg_resizable.SetLayoutAnchor(stc1, mzcLA_BOTTOM_LEFT, mzcLA_BOTTOM_LEFT);
 	// edt1: 下端に張り付いたまま、幅だけ伸縮させる
 	xg_resizable.SetLayoutAnchor(edt1, mzcLA_BOTTOM_LEFT, mzcLA_BOTTOM_RIGHT);
 	// IDOK（Enterボタン）: サイズは固定のまま右下に追従させる
 	xg_resizable.SetLayoutAnchor(IDOK, mzcLA_BOTTOM_RIGHT);
+
+	// イメージをセット
+	SendDlgItemMessageW(hwnd, stc1, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM)g_hbmFairy);
 }
 
 // Ctrl+ホイールによるズーム。lst1/edt1/IDOKのフォントを一括で変更する。
@@ -1128,6 +1213,9 @@ static BOOL Helper_OnInitDialog(HWND hwnd, HWND hwndFocus, LPARAM lParam)
 	{
 		MoveWindow(hwnd, xg_nHelperX, xg_nHelperY, xg_nHelperCX, xg_nHelperCY, TRUE);
 	}
+
+	std::wstring str = XgGetAIStatus();
+	Helper_AddLine(hwnd, str.c_str());
 
 	return FALSE;
 }
@@ -1214,6 +1302,12 @@ static void Helper_OnDestroy(HWND hwnd)
 		DeleteObject(g_hFont);
 		g_hFont = nullptr;
 	}
+
+	if (g_hbmFairy)
+	{
+		DeleteObject(g_hbmFairy);
+		g_hbmFairy = nullptr;
+	}
 }
 
 // WM_CLOSE
@@ -1247,8 +1341,8 @@ static void Helper_OnTimer(HWND hwnd, UINT id)
 // WM_GETMINMAXINFO: ウィンドウの大きさを制限する。
 static void Helper_OnGetMinMaxInfo(HWND hwnd, LPMINMAXINFO lpMinMaxInfo)
 {
-	lpMinMaxInfo->ptMinTrackSize.x = 100;
-	lpMinMaxInfo->ptMinTrackSize.y = 100;
+	lpMinMaxInfo->ptMinTrackSize.x = 200;
+	lpMinMaxInfo->ptMinTrackSize.y = 200;
 }
 
 static INT_PTR CALLBACK
@@ -1335,4 +1429,77 @@ BOOL Helper_Open(HWND hwndOwner)
 	UpdateWindow(hwnd);
 
 	return TRUE;
+}
+
+// AIModels.dat をパースし、すべての [MODELS:provider] セクションを取り出す。
+// Parse AIModels.dat and extract every [MODELS:provider] section.
+static void Helper_LoadAIModels(std::map<std::wstring, std::vector<std::wstring>>& out)
+{
+	out.clear();
+
+	for (const auto& entry : GetAIModelsDatLines())
+	{
+		const std::wstring& section = entry.first;
+		const std::wstring& line = entry.second;
+
+		// "MODELS:provider" セクションのみ処理する。
+		if (section.compare(0, 7, L"MODELS:") == 0)
+			out[section.substr(7)].push_back(line);
+	}
+}
+
+std::map<std::wstring, std::vector<std::wstring>> xg_knownAIModels;
+
+// AIモデル群を取得する。
+BOOL Helper_GetAIModels(PCWSTR provider, std::vector<std::wstring>& models)
+{
+	models.clear();
+
+	if (xg_knownAIModels.empty())
+		Helper_LoadAIModels(xg_knownAIModels);
+
+	for (const auto& entry : xg_knownAIModels)
+	{
+		if (lstrcmpiW(provider, entry.first.c_str()) == 0)
+		{
+			models = entry.second;
+			return TRUE;
+		}
+	}
+
+	return FALSE;
+}
+
+// AIModels.dat から、プロバイダー名の一覧をで読み込む。
+// Load the list of provider names from AIModels.dat.
+static void Helper_LoadAIProviders(std::vector<std::wstring>& out)
+{
+	out.clear();
+
+	for (const auto& entry : GetAIModelsDatLines())
+	{
+		if (entry.first != L"PROVIDER_INFO")
+			continue;
+
+		// "provider = fields..." からプロバイダー名を抽出する。
+		size_t eq = entry.second.find(L'=');
+		if (eq == std::wstring::npos)
+			continue;
+		std::wstring name = TrimW(entry.second.substr(0, eq));
+		if (!name.empty())
+			out.push_back(name);
+	}
+}
+
+std::vector<std::wstring> xg_knownAIProviders;
+
+// AIModels.datからプロバイダー名の一覧を取得する。
+// Get the list of provider names from AIModels.dat.
+BOOL Helper_GetAIProviders(std::vector<std::wstring>& providers)
+{
+	if (xg_knownAIProviders.empty())
+		Helper_LoadAIProviders(xg_knownAIProviders);
+
+	providers = xg_knownAIProviders;
+	return !providers.empty();
 }
